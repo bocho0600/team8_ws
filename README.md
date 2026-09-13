@@ -6,31 +6,89 @@ ROS Noetic catkin workspace for the UAV (Team 8): MAVROS/PX4 flight control (`sp
 
 The workspace ships with a ready-to-use Docker environment — no need to install ROS Noetic, mavros, or any package dependencies on the host.
 
-**1. Build the image:**
+**1. Configure your machine:**
+
+```
+cp .env.example .env
+```
+
+Fill in the three values in `.env` (Docker Compose reads it automatically — see [Multi-machine setup](#multi-machine-setup-gcs--uav) below for how they're used):
+
+| Variable | What it is |
+|---|---|
+| `UAV_IP` | IP of the Raspberry Pi on the drone (runs `roscore`) |
+| `GCS_IP` | IP of the ground control station laptop |
+| `VICON_SERVER_DVP` | Motion-capture (Vicon) server address |
+
+**2. Build the image:**
 
 ```
 docker compose build
 ```
 
-**2. Start the container:**
+**3. Start the container:**
 
 ```
 docker compose run --rm catkin_ws
 ```
 
-This drops you into a shell inside the container, running as the `uavteam8` user with the workspace already sourced (`ROS_PACKAGE_PATH` and `devel/setup.bash` set up).
+This drops you into a shell inside the container, running as the `uavteam8` user with the workspace already sourced (`ROS_PACKAGE_PATH` and `devel/setup.bash` set up) and `ROS_IP`/`ROS_MASTER_URI` already pointed at the UAV.
 
-**3. Launch the flight stack:**
+**4. Launch the flight stack:**
 
-```
-roslaunch /home/uavteam8/catkin_ws/launch/control.launch
-```
+- **On the UAV**, bring up the entire stack (roscore, MAVROS/spar, vision, path planner, vicon/optitrack, ArUco mission node, position monitors, bag recording) in one tmux session:
 
-This brings up MAVROS (connecting to the flight controller over `fcu_url`, default `/dev/ttyAMA1:921600`) and the `spar` node. Override the FCU connection at launch time if needed, e.g.:
+  ```
+  run_uav_stack
+  ```
 
-```
-roslaunch /home/uavteam8/catkin_ws/launch/control.launch fcu_url:=/dev/ttyUSB0:57600
-```
+  See [Multi-machine setup](#multi-machine-setup-gcs--uav) for what each pane does.
+
+- **Individually**, any launch file works the normal way, e.g.:
+
+  ```
+  roslaunch /home/uavteam8/catkin_ws/launch/control.launch
+  ```
+
+  Override the FCU connection at launch time if needed:
+
+  ```
+  roslaunch /home/uavteam8/catkin_ws/launch/control.launch fcu_url:=/dev/ttyUSB0:57600
+  ```
+
+## Multi-machine setup (GCS + UAV)
+
+This project runs across (at least) two machines — the Raspberry Pi on the drone (UAV) and a ground control station laptop (GCS) — plus a Vicon/OptiTrack motion-capture rig. `.env` (copied from `.env.example`, gitignored — one copy per machine) tells the container about all three:
+
+- **`UAV_IP`** — the container's `ros.sh` (loaded into every interactive shell) uses this to default `ROS_MASTER_URI=http://$UAV_IP:11311`, since the UAV runs `roscore`. Call `disros` with no arguments to (re-)apply this and auto-detect your own `ROS_IP`; pass an explicit master IP to point elsewhere for one shell, e.g. `disros 192.168.1.50`.
+- **`GCS_IP`** — passed to MAVROS as `gcs_url` (`udp://@$GCS_IP:14550`) by `run_uav_stack`, so QGroundControl/telemetry on the GCS can connect.
+- **`VICON_SERVER_DVP`** — passed to `qutas_lab_450`'s `environment.launch` as `vicon_server_dvp`.
+
+**`run_uav_stack`** (run on the UAV) opens a `uav_stack` tmux session with:
+
+| Pane | Command |
+|---|---|
+| roscore | `roscore` |
+| system monitor | `htop` |
+| free terminal | — |
+| flight control | `control.launch` (MAVROS + `spar`, with `gcs_url` set from `GCS_IP`) |
+| vision + servo | `combined_nodes.launch` |
+| vicon/optitrack + grid | `qutas_lab_450 environment.launch` (with `vicon_server_dvp` set from `VICON_SERVER_DVP`) |
+| path planner | `breadcrumb.launch` |
+| ArUco mission node | `rosrun spar_node demo_ml` |
+| local position monitor | `rostopic echo /mavros/local_position/pose` |
+| vision pose monitor | `rostopic echo /mavros/vision_pose/pose` |
+| bag recording | `rosbag record -a` (written to `~/catkin_ws/bags/`) |
+| kill switch | `tmux kill-session -t uav_stack` staged, not run — press Enter in that pane to tear the whole stack down |
+
+Each launch is staggered with a `sleep` so `roscore` and MAVROS are up before dependents start.
+
+**Helper functions**, available in any pane/shell once the ArUco mission node (`demo_ml`) is running:
+
+- `servo_open1` / `servo_open2` — publish to `/actuator_control/actuator_a` to trigger the payload servo
+- `aruco_land <marker_id|frame>` / `aruco_roi <marker_id|frame>` — call the `/aruco/land` / `/aruco/roi` services
+- `aruco_land_point <x> <y> <z>` — publish a manual landing point override
+- `aruco_frames` — list detected `target_*` TF frames
 
 **Other launch files** in [`launch/`](launch/):
 

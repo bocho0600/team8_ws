@@ -10,8 +10,14 @@ services:
     # is normally run on the Pi itself.
     network_mode: host
     environment:
-      - ROS_MASTER_URI=${ROS_MASTER_URI:-http://localhost:11311}
+      # The UAV runs roscore, so both machines default to pointing at it.
+      # ROS_IP is left for the container's ros.sh (disros) to auto-detect via
+      # `hostname -I` on each interactive shell.
+      - ROS_MASTER_URI=http://${UAV_IP:-localhost}:11311
       - ROS_IP=${ROS_IP:-}
+      - UAV_IP=${UAV_IP:-}
+      - GCS_IP=${GCS_IP:-}
+      - VICON_SERVER_DVP=${VICON_SERVER_DVP:-10.68.42.85}
       - DISPLAY=${DISPLAY}
       - QT_X11_NO_MITSHM=1
     volumes:

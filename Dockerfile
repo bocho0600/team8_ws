@@ -16,6 +16,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ros-noetic-mavros-extras \
         ros-noetic-vrpn-client-ros \
         ros-noetic-topic-tools \
+        tmux \
+        htop \
     && rm -rf /var/lib/apt/lists/*
 
 # GeographicLib datasets required by mavros for local/global position conversions
@@ -50,6 +52,11 @@ RUN chown -R $USER_UID:$USER_GID $CATKIN_WS
 
 COPY --chown=$USER_UID:$USER_GID docker/entrypoint.sh /home/$USERNAME/entrypoint.sh
 RUN chmod +x /home/$USERNAME/entrypoint.sh
+
+# ROS environment + disros/run_uav_stack/aruco helper functions, loaded into
+# every interactive shell (tmux panes spawned from one inherit it too).
+COPY --chown=$USER_UID:$USER_GID docker/bashrc.d/ros.sh /home/$USERNAME/.bashrc.d/ros.sh
+RUN echo '[ -f ~/.bashrc.d/ros.sh ] && source ~/.bashrc.d/ros.sh' >> /home/$USERNAME/.bashrc
 
 USER $USERNAME
 
