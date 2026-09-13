@@ -1,17 +1,5 @@
-# UAV-role setup, sourced by ros.sh when ROLE=uav.
-# The UAV runs its own roscore, so it's the ROS master by default.
-
-# Auto-detects this machine's own IP. Leaves ROS_MASTER_URI on its default
-# (localhost, i.e. this machine) unless given an explicit master to join.
-disros() {
-  export ROS_IP="$(hostname -I | cut -d' ' -f1)"
-  echo "Identifying as: $ROS_IP"
-
-  if [ -n "$1" ]; then
-    export ROS_MASTER_URI="http://$1:11311"
-    echo "Connecting to: $ROS_MASTER_URI"
-  fi
-}
+# UAV-role tmux launcher, sourced by ros.sh when ROLE=uav.
+# (Shared setup, disros and the aruco/servo helpers live in ros.sh.)
 
 # --- Full UAV flight stack in tmux ------------------------------------------
 # roscore, MAVROS + spar flight control, vision pipeline, path planner,
@@ -79,4 +67,4 @@ function run_uav_stack() {
     tmux attach-session -t uav_stack
 }
 
-export -f disros run_uav_stack
+export -f run_uav_stack

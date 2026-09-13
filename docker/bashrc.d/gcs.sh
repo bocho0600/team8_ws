@@ -1,20 +1,5 @@
-# GCS-role setup, sourced by ros.sh when ROLE=gcs.
-# The UAV runs roscore, so the GCS is a client by default.
-
-# Auto-detects this machine's own IP and points ROS_MASTER_URI at the UAV
-# (UAV_IP, from .env) by default. Call with an explicit master IP to
-# override for one shell, e.g. to point at yourself for local SITL testing:
-#   disros $(hostname -I)
-disros() {
-  export ROS_IP="$(hostname -I | cut -d' ' -f1)"
-  echo "Identifying as: $ROS_IP"
-
-  local master="${1:-$UAV_IP}"
-  if [ -n "$master" ]; then
-    export ROS_MASTER_URI="http://$master:11311"
-    echo "Connecting to: $ROS_MASTER_URI"
-  fi
-}
+# GCS-role tmux launchers, sourced by ros.sh when ROLE=gcs.
+# (Shared setup, disros and the aruco/servo helpers live in ros.sh.)
 
 # --- GCS emulator/monitoring stack in tmux ----------------------------------
 # spar_uavasr.launch (spar node + software-in-the-loop uavasr emulator, so
@@ -70,4 +55,4 @@ function gcs_tmux_sim() {
     gcs_tmux
 }
 
-export -f disros gcs_tmux gcs_tmux_sim
+export -f gcs_tmux gcs_tmux_sim

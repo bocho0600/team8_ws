@@ -23,5 +23,5 @@ __pycache__/
 *.swp
 .DS_Store
 
-# machine-specific distributed-ROS settings (copy from .env.example)
+# machine-specific distributed-ROS settings (generate with ./setup-env.sh)
 .env

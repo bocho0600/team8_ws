@@ -10,7 +10,7 @@ services:
     # is normally run on the Pi itself.
     network_mode: host
     environment:
-      # ROLE picks docker/bashrc.d/uav.sh or gcs.sh (see .env.example).
+      # ROLE picks docker/bashrc.d/uav.sh or gcs.sh (set by ./setup-env.sh).
       # ROS_MASTER_URI here is just the container-level baseline; each
       # interactive shell's `disros` (role-specific) sets the real default —
       # self for the UAV, UAV_IP for the GCS. ROS_IP is left for `disros` to
