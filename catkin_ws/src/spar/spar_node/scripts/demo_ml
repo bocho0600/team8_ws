@@ -123,9 +123,10 @@ def send_wp(
         yaw,
         wait_time=2.0):
 
+    # NOTE: keep this default in sync with send_wp_scan().
     speed = rospy.get_param(
         "~speed",
-        1.0
+        0.5
     )
 
     accuracy = rospy.get_param(
@@ -233,9 +234,10 @@ def send_wp_scan(
     leg.
     """
 
+    # NOTE: keep this default in sync with send_wp().
     speed = rospy.get_param(
         "~speed",
-        1.0
+        0.7
     )
 
     accuracy = rospy.get_param(
@@ -553,6 +555,72 @@ def follow_breadcrumb_path(
             return False
 
     return True
+
+
+# ============================================================
+# Take-off
+#
+# MOTION_TAKEOFF, not MOTION_GOTO: spar flies this as a pure
+# vertical velocity climb at the current x/y, then switches to
+# position hold. A GOTO from the ground would instead ramp a
+# position setpoint through x, y and z together, dragging the
+# UAV diagonally off the pad while it climbs.
+#
+# x/y/yaw in the goal are ignored by spar for this motion.
+# ============================================================
+
+def takeoff(spar_client, height):
+
+    goal = FlightMotionGoal()
+
+    goal.motion = FlightMotionGoal.MOTION_TAKEOFF
+
+    goal.position.z = height
+
+    goal.velocity_vertical = rospy.get_param(
+        "~takeoff_speed",
+        0.5
+    )
+
+    goal.wait_for_convergence = True
+
+    goal.position_radius = rospy.get_param(
+        "~accuracy",
+        0.1
+    )
+
+    # spar rejects the goal outright if yaw_range <= 0 whenever
+    # wait_for_convergence is set, even though take-off holds yaw.
+    goal.yaw_range = rospy.get_param(
+        "~accuracy",
+        0.1
+    )
+
+    rospy.loginfo(
+        "Taking off to %.2f m...",
+        height
+    )
+
+    spar_client.send_goal(goal)
+
+    spar_client.wait_for_result()
+
+    state = spar_client.get_state()
+
+    if state == GoalStatus.SUCCEEDED:
+
+        rospy.loginfo(
+            "Take-off complete!"
+        )
+
+        return True
+
+    rospy.logerr(
+        "Take-off failed. Action state: %d",
+        state
+    )
+
+    return False
 
 
 # ============================================================
@@ -1499,38 +1567,85 @@ def send_wps(
 
     # ========================================================
     # Scan waypoints
+    #
+    # Boustrophedon ("lawnmower") over x = -2.5..2.5, y = -2.5..2.5,
+    # six lanes at 1.0 m spacing. Each lane is swept end to end and
+    # alternates direction, so consecutive waypoints only ever differ
+    # in ONE axis: along-lane in y, or a 1.0 m hop in x at the turn.
+    #
+    # Keep it that way. Any pair of waypoints that differs in both x
+    # and y is a diagonal across the search area, and everything the
+    # diagonal skips past goes unscanned - which is exactly what the
+    # earlier version did between (-2.5, -2.5) and (-1.5, 2.5),
+    # silently dropping the whole x = -2.5 lane.
+    #
+    # The mid-lane y = 0.0 points are not turns; they give Breadcrumb
+    # a shorter segment to re-plan when a target diversion interrupts
+    # a lane.
     # ========================================================
 
     wps = [
 
-        [-1.0, -1.0, height, 0.0],
-
+        # lane x = -2.5, south -> north
         [-2.5, -2.5, height, 0.0],
+        [-2.5,  0.0, height, 0.0],
+        [-2.5,  2.5, height, 0.0],
 
+        # lane x = -1.5, north -> south
         [-1.5,  2.5, height, 0.0],
         [-1.5,  0.0, height, 0.0],
         [-1.5, -2.5, height, 0.0],
 
+        # lane x = -0.5, south -> north
         [-0.5, -2.5, height, 0.0],
-
         [-0.5,  0.0, height, 0.0],
         [-0.5,  2.5, height, 0.0],
 
+        # lane x = 0.5, north -> south
         [0.5,  2.5, height, 0.0],
-
         [0.5,  0.0, height, 0.0],
         [0.5, -2.5, height, 0.0],
 
+        # lane x = 1.5, south -> north
         [1.5, -2.5, height, 0.0],
-
         [1.5,  0.0, height, 0.0],
         [1.5,  2.5, height, 0.0],
 
+        # lane x = 2.5, north -> south
         [2.5,  2.5, height, 0.0],
-
         [2.5,  0.0, height, 0.0],
         [2.5, -2.5, height, 0.0],
     ]
+
+    # ========================================================
+    # Take-off, then fly to the start of the scan pattern.
+    #
+    # The segment loop below assumes the UAV is already at
+    # wps[0], so it has to actually be put there. Skipping this
+    # (~do_takeoff:=false) keeps the old behaviour: the UAV is
+    # assumed to be airborne at wps[0] already, e.g. because
+    # `rosrun spar_node takeoff` was run by hand first.
+    # ========================================================
+
+    if rospy.get_param("~do_takeoff", True):
+
+        if not takeoff(spar_client, height):
+            return False
+
+        # Take-off climbs straight up over the pad, so the UAV is
+        # at the right altitude but not yet at wps[0].
+        if not send_wp(
+                spar_client,
+                wps[0][0],
+                wps[0][1],
+                wps[0][2],
+                wps[0][3]):
+
+            rospy.logerr(
+                "Failed to reach the scan start position."
+            )
+
+            return False
 
     # ========================================================
     # Initial position
