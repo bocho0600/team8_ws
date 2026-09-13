@@ -7,9 +7,39 @@ ROS Noetic catkin workspace for the UAV (Team 8): MAVROS/PX4 flight control (`sp
 The workspace ships with a ready-to-use Docker environment — no need to install ROS Noetic, mavros, or any package dependencies on the host. You'll set this up on **two machines**: the Raspberry Pi on the drone (**UAV**) and a ground control station laptop (**GCS**). Both use the exact same repo and image — only `.env` differs between them.
 
 Prerequisites on both machines:
-- Docker + Docker Compose installed
 - This repo cloned
 - Both machines reachable from each other on the same network (LAN/WiFi)
+- Docker installed **from Docker's apt repository, not the snap** — see below
+
+### Installing Docker
+
+Use the official apt packages. Two things to avoid:
+
+- The Canonical **snap** build is strictly confined and blocks what this project needs — passing through the flight controller's serial device (`/dev/tty*`) and `privileged` mode. It also creates no `docker` group, so `usermod -aG docker` fails with `group 'docker' does not exist`.
+- The `get.docker.com` convenience script **fails on Ubuntu 20.04 (focal)**, which is what the Pi runs for ROS Noetic. It tries to install `docker-model-plugin`, which isn't published for focal — and since `apt-get install` is atomic, that one missing package aborts the whole install, leaving nothing behind.
+
+Set up the repo and install the packages explicitly instead:
+
+```bash
+sudo snap remove docker   # only if the snap is installed
+sudo apt-get update && sudo apt-get install -y ca-certificates curl
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+  | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+sudo apt-get update
+sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+```
+
+Then add yourself to the `docker` group (created by `docker-ce`'s post-install):
+
+```bash
+hash -r && sudo usermod -aG docker "$USER" && newgrp docker
+docker run --rm hello-world
+```
+
+`newgrp docker` applies the group to the current shell; otherwise log out and back in. `hash -r` clears any path bash cached for a previously removed docker binary — without it you may see `/snap/bin/docker: No such file or directory` even after a successful install.
 
 ### On the UAV (Raspberry Pi)
 
@@ -29,26 +59,38 @@ Prerequisites on both machines:
 
    This writes `.env` (gitignored — it's what `docker compose` reads) with `ROLE=uav` plus these three values. Re-run the script any time an IP changes; it pre-fills from the existing `.env`. Find the Pi's own IP with `hostname -I` if you don't have it handy.
 
-2. **Connect the flight controller.** In [`docker-compose.yml`](docker-compose.yml), uncomment the `devices:` block and set the serial path your FCU actually enumerates as (check with `ls /dev/tty*` before and after plugging it in):
+2. **Connect the flight controller.** In [`docker-compose.yml`](docker-compose.yml), uncomment the `devices:` block and set the serial path your FCU actually enumerates as (check with `ls -l /dev/tty*` before and after plugging it in):
 
    ```yaml
    devices:
-     - /dev/ttyUSB0:/dev/ttyUSB0
-     # - /dev/ttyACM0:/dev/ttyACM0
+     - /dev/ttyAMA1:/dev/ttyAMA1   # Pi GPIO UART — control.launch's default
+     # - /dev/ttyUSB0:/dev/ttyUSB0 # USB-attached FCU instead
    ```
 
-   [`control.launch`](launch/control.launch) defaults to `fcu_url:=/dev/ttyAMA1:921600` — if your FCU is on a different port/baud, either edit that default or pass `fcu_url:=...` when launching (step 4).
+   [`control.launch`](catkin_ws/launch/control.launch) defaults to `fcu_url:=/dev/ttyAMA1:921600` — if your FCU is on a different port/baud, either edit that default or pass `fcu_url:=...` when launching (step 4).
 
-3. **Build and start the container:**
+3. **Get the image.** Building on the Pi works but is slow (roughly 30–60 minutes, and ~4.3GB of SD card), so prefer the prebuilt arm64 image that CI publishes:
+
+   ```
+   docker pull ghcr.io/bocho0600/team8_ws:latest
+   docker tag ghcr.io/bocho0600/team8_ws:latest uavteam8/catkin_ws:latest
+   ```
+
+   The tag makes `docker compose` use it as-is instead of rebuilding. To build locally anyway — after changing a `package.xml`, say:
 
    ```
    docker compose build
+   ```
+
+4. **Start the container:**
+
+   ```
    docker compose run --rm catkin_ws
    ```
 
    This drops you into a shell as the `uavteam8` user, with the workspace already sourced and `ROLE=uav` applied — `disros` has already run once (see [Multi-machine setup](#multi-machine-setup-gcs--uav)), so this container is its own ROS master (it runs `roscore`, not the GCS).
 
-4. **Launch.** Bring up the entire flight stack in one tmux session:
+5. **Launch.** Bring up the entire flight stack in one tmux session:
 
    ```
    run_uav_stack
@@ -86,6 +128,8 @@ Prerequisites on both machines:
    docker compose build
    docker compose run --rm catkin_ws
    ```
+
+   Building on a laptop is quick enough that this is the default here; the prebuilt image from [Using the prebuilt image](#using-the-prebuilt-image) works on the GCS too if you'd rather skip it.
 
    With `ROLE=gcs`, `disros` has already pointed `ROS_MASTER_URI` at the UAV (`UAV_IP`) for you. Sanity-check the connection before launching anything:
 
@@ -177,7 +221,7 @@ Opens a `gcs_stack` tmux session:
 - `aruco_land_point <x> <y> <z>` — publish a manual landing point override
 - `aruco_frames` — list detected `target_*` TF frames
 
-**Other launch files** in [`launch/`](launch/):
+**Other launch files** in [`launch/`](catkin_ws/launch/):
 
 | File | What it starts |
 |---|---|
@@ -187,8 +231,34 @@ Opens a `gcs_stack` tmux session:
 
 Run any of them the same way: `roslaunch /home/uavteam8/catkin_ws/launch/<file>.launch`.
 
+## CI / CD
+
+Two GitHub Actions workflows:
+
+- **[`ci.yml`](.github/workflows/ci.yml)** — runs on every push and PR. Shellchecks the scripts, exercises `setup-env.sh` (including the regression where the role argument used to be clobbered by an existing `.env`), builds the image, and runs [`ci/smoke-test.sh`](ci/smoke-test.sh) against it.
+- **[`publish.yml`](.github/workflows/publish.yml)** — on pushes to `main` and `v*` tags, builds `linux/amd64` and `linux/arm64` on **native runners** (no QEMU) and pushes a multi-arch manifest to `ghcr.io/bocho0600/team8_ws`.
+
+`ci/smoke-test.sh` also runs locally against any built image:
+
+```bash
+./ci/smoke-test.sh uavteam8/catkin_ws:latest
+```
+
+It asserts the things that are easy to break silently: role dispatch (UAV stays self-mastered, GCS targets `UAV_IP`, bad role warns and falls back), that each role gets only its own launcher, that every launch file still resolves its includes, that the GUI tooling is present, and that the tmux kill-switch panes stay *staged* rather than armed.
+
+### Using the prebuilt image
+
+Once `publish.yml` has run, either machine can skip the local build:
+
+```bash
+docker pull ghcr.io/bocho0600/team8_ws:latest
+```
+
+Docker picks the right architecture automatically. To use it instead of building, point `image:` in [`docker-compose.yml`](docker-compose.yml) at that tag and drop the `build:` block. Building locally stays the default so source edits don't need a round trip through CI.
+
 ### Notes
 
+- The image is based on `ros:noetic-perception`, which publishes amd64 **and** arm64 — the `osrf/ros:noetic-desktop-*` tags are amd64-only and cannot be built on the Pi. rviz and the rqt plugins are apt-installed on top instead of coming from the base.
 - `network_mode: host` is used so mavros/GCS/vrpn can reach other machines on the LAN, the same as running directly on the Pi.
 - `./src` and `./launch` are bind-mounted, so source edits on the host are picked up without rebuilding — rebuild (`docker compose build`) whenever a `package.xml` or `CMakeLists.txt` dependency changes.
 - Serial devices (flight controller, etc.) are commented out in [`docker-compose.yml`](docker-compose.yml) by default — see step 2 of the [UAV setup](#on-the-uav-raspberry-pi) above.

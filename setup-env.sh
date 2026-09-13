@@ -18,6 +18,7 @@ ENV_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.env"
 # Re-running should offer what's already configured, so source any existing
 # .env for defaults. It's plain KEY=VALUE, so this is safe — but it also sets
 # ROLE, so the argument is applied after this, not before.
+# shellcheck source=/dev/null
 [ -f "$ENV_FILE" ] && . "$ENV_FILE"
 ROLE="$NEW_ROLE"
 
@@ -26,9 +27,17 @@ echo "-----------------------------------------------"
 echo "Press Enter to keep the pre-filled value."
 echo
 
-read -e -i "$UAV_IP" -p "UAV IP address (Raspberry Pi): " UAV_IP
-read -e -i "$GCS_IP" -p "GCS IP address (ground station): " GCS_IP
-read -e -i "${VICON_SERVER_DVP:-10.68.42.85}" -p "Vicon server IP: " VICON_SERVER_DVP
+VICON_SERVER_DVP="${VICON_SERVER_DVP:-10.68.42.85}"
+
+# Empty input keeps the current value. readline's -i prefill only applies on a
+# terminal, so this fallback is what makes "press Enter to keep" hold when
+# input is piped (scripted installs, CI).
+read -r -e -i "$UAV_IP" -p "UAV IP address (Raspberry Pi): " reply
+UAV_IP="${reply:-$UAV_IP}"
+read -r -e -i "$GCS_IP" -p "GCS IP address (ground station): " reply
+GCS_IP="${reply:-$GCS_IP}"
+read -r -e -i "$VICON_SERVER_DVP" -p "Vicon server IP: " reply
+VICON_SERVER_DVP="${reply:-$VICON_SERVER_DVP}"
 
 if [ -z "$UAV_IP" ] || [ -z "$GCS_IP" ]; then
     echo "UAV IP and GCS IP are both required." >&2

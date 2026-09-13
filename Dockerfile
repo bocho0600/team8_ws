@@ -1,10 +1,17 @@
-FROM osrf/ros:noetic-desktop-full
+# ros:noetic-perception is multi-arch (amd64 + arm64 + armv7) and ships
+# vision_opencv/cv_bridge, which image_processing needs. The osrf/*-desktop-*
+# tags are amd64-only, so they can't be built on the Raspberry Pi — the GUI
+# tools they used to provide are apt-installed below instead.
+FROM ros:noetic-perception
 
 ARG USERNAME=uavteam8
 ARG USER_UID=1000
 ARG USER_GID=$USER_UID
 
 # --- System deps ---------------------------------------------------------
+# rosdep (below) resolves everything declared in the package.xml files; the
+# heavy, rarely-changing packages are listed here so they land in a layer
+# that survives source edits.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         git \
@@ -16,6 +23,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ros-noetic-mavros-extras \
         ros-noetic-vrpn-client-ros \
         ros-noetic-topic-tools \
+        ros-noetic-rviz \
+        ros-noetic-rqt-gui \
+        ros-noetic-rqt-gui-py \
+        ros-noetic-image-transport-plugins \
+        python3-matplotlib \
         tmux \
         htop \
     && rm -rf /var/lib/apt/lists/*

@@ -2,10 +2,14 @@
 # Shared ROS setup and helpers, then the role-specific tmux launcher
 # (uav.sh or gcs.sh) selected by ROLE in .env.
 
+# shellcheck source=/dev/null
 source /opt/ros/noetic/setup.bash
+# shellcheck source=/dev/null
 source ~/catkin_ws/devel/setup.bash
 
-CATKIN_WS="$HOME/catkin_ws"
+# Exported so the tmux launchers in uav.sh/gcs.sh (and the panes they spawn)
+# see it too.
+export CATKIN_WS="$HOME/catkin_ws"
 
 # --- Role ------------------------------------------------------------------
 # The two roles differ only in their default ROS master: the UAV runs its own
@@ -25,8 +29,10 @@ esac
 # Auto-detects this machine's own IP and applies the role's default master.
 # Pass an explicit master IP to override for one shell:
 #   disros 192.168.1.50
+# shellcheck disable=SC2120  # the master argument is intentionally optional
 disros() {
-  export ROS_IP="$(hostname -I | cut -d' ' -f1)"
+  ROS_IP="$(hostname -I | cut -d' ' -f1)"
+  export ROS_IP
   echo "Identifying as: $ROS_IP"
 
   local master="${1:-$_ROS_DEFAULT_MASTER}"
@@ -97,6 +103,8 @@ function aruco_frames() {
 export -f disros servo_open1 servo_open2 _aruco_frame_arg aruco_land aruco_roi aruco_land_point aruco_frames
 
 # --- Role-specific tmux launcher --------------------------------------------
+# shellcheck source=/dev/null
 source "$(dirname "${BASH_SOURCE[0]}")/${ROLE}.sh"
 
+# shellcheck disable=SC2119  # no argument means "use the role's default master"
 disros

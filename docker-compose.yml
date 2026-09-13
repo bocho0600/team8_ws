@@ -21,7 +21,9 @@ services:
       - UAV_IP=${UAV_IP:-}
       - GCS_IP=${GCS_IP:-}
       - VICON_SERVER_DVP=${VICON_SERVER_DVP:-10.68.42.85}
-      - DISPLAY=${DISPLAY}
+      # :- keeps compose quiet on headless/SSH sessions where DISPLAY is unset;
+      # only the rviz/rqt GUI panes need it.
+      - DISPLAY=${DISPLAY:-}
       - QT_X11_NO_MITSHM=1
     volumes:
       # Live-edit source without rebuilding the image; rebuild the image
@@ -30,11 +32,13 @@ services:
       - ./catkin_ws/launch:/home/uavteam8/catkin_ws/launch
       # X11 socket, for rqt_*/rviz GUI tools.
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
-    # Uncomment and adjust for whatever serial device the flight controller
-    # (mavros fcu_url) or other peripherals enumerate as on your host.
+    # Uncomment on the UAV for the flight controller's serial port. The Pi's
+    # GPIO UART is /dev/ttyAMA1, matching control.launch's fcu_url default;
+    # a USB-attached FCU shows up as /dev/ttyUSB0 or /dev/ttyACM0 instead.
+    # Check with `ls -l /dev/tty*` before and after plugging it in.
     # devices:
+    #   - /dev/ttyAMA1:/dev/ttyAMA1
     #   - /dev/ttyUSB0:/dev/ttyUSB0
-    #   - /dev/ttyACM0:/dev/ttyACM0
     privileged: true
     stdin_open: true
     tty: true
