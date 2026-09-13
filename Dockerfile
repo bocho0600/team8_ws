@@ -53,9 +53,10 @@ RUN chown -R $USER_UID:$USER_GID $CATKIN_WS
 COPY --chown=$USER_UID:$USER_GID docker/entrypoint.sh /home/$USERNAME/entrypoint.sh
 RUN chmod +x /home/$USERNAME/entrypoint.sh
 
-# ROS environment + disros/run_uav_stack/aruco helper functions, loaded into
-# every interactive shell (tmux panes spawned from one inherit it too).
-COPY --chown=$USER_UID:$USER_GID docker/bashrc.d/ros.sh /home/$USERNAME/.bashrc.d/ros.sh
+# ROS environment + role-specific (uav.sh/gcs.sh, picked by ROLE) tmux
+# launcher + shared aruco/servo helpers, loaded into every interactive shell
+# (tmux panes spawned from one inherit it too).
+COPY --chown=$USER_UID:$USER_GID docker/bashrc.d/ /home/$USERNAME/.bashrc.d/
 RUN echo '[ -f ~/.bashrc.d/ros.sh ] && source ~/.bashrc.d/ros.sh' >> /home/$USERNAME/.bashrc
 
 USER $USERNAME

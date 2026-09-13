@@ -12,10 +12,11 @@ The workspace ships with a ready-to-use Docker environment — no need to instal
 cp .env.example .env
 ```
 
-Fill in the three values in `.env` (Docker Compose reads it automatically — see [Multi-machine setup](#multi-machine-setup-gcs--uav) below for how they're used):
+Fill in the four values in `.env` (Docker Compose reads it automatically — see [Multi-machine setup](#multi-machine-setup-gcs--uav) below for how they're used). `ROLE` differs per machine; the rest are the same on both:
 
 | Variable | What it is |
 |---|---|
+| `ROLE` | `uav` or `gcs` — picks which tmux launcher/`disros` default this machine gets |
 | `UAV_IP` | IP of the Raspberry Pi on the drone (runs `roscore`) |
 | `GCS_IP` | IP of the ground control station laptop |
 | `VICON_SERVER_DVP` | Motion-capture (Vicon) server address |
@@ -58,9 +59,14 @@ This drops you into a shell inside the container, running as the `uavteam8` user
 
 ## Multi-machine setup (GCS + UAV)
 
-This project runs across (at least) two machines — the Raspberry Pi on the drone (UAV) and a ground control station laptop (GCS) — plus a Vicon/OptiTrack motion-capture rig. `.env` (copied from `.env.example`, gitignored — one copy per machine) tells the container about all three:
+This project runs across (at least) two machines — the Raspberry Pi on the drone (UAV) and a ground control station laptop (GCS) — plus a Vicon/OptiTrack motion-capture rig. `.env` (copied from `.env.example`, gitignored — one copy per machine, with a different `ROLE`) tells the container about all of this.
 
-- **`UAV_IP`** — the container's `ros.sh` (loaded into every interactive shell) uses this to default `ROS_MASTER_URI=http://$UAV_IP:11311`, since the UAV runs `roscore`. Call `disros` with no arguments to (re-)apply this and auto-detect your own `ROS_IP`; pass an explicit master IP to point elsewhere for one shell, e.g. `disros 192.168.1.50`.
+`ros.sh` (loaded into every interactive shell) sources shared setup from `docker/bashrc.d/common.sh`, then `uav.sh` or `gcs.sh` based on `ROLE` — each defines its own `disros` default, since the two roles want opposite behavior:
+
+- **`ROLE=uav`** (`docker/bashrc.d/uav.sh`) — the UAV runs `roscore`, so it's its own ROS master by default; `disros` (no args) just re-detects `ROS_IP` and leaves `ROS_MASTER_URI` alone. Defines `run_uav_stack`.
+- **`ROLE=gcs`** (`docker/bashrc.d/gcs.sh`) — the GCS is a client by default; `disros` (no args) points `ROS_MASTER_URI` at `UAV_IP`. Pass an explicit IP to override for one shell, e.g. `disros 192.168.1.50`. Defines `gcs_tmux` and `gcs_tmux_sim`.
+
+Both roles share:
 - **`GCS_IP`** — passed to MAVROS as `gcs_url` (`udp://@$GCS_IP:14550`) by `run_uav_stack`, so QGroundControl/telemetry on the GCS can connect.
 - **`VICON_SERVER_DVP`** — passed to `qutas_lab_450`'s `environment.launch` as `vicon_server_dvp`.
 
@@ -82,6 +88,23 @@ This project runs across (at least) two machines — the Raspberry Pi on the dro
 | kill switch | `tmux kill-session -t uav_stack` staged, not run — press Enter in that pane to tear the whole stack down |
 
 Each launch is staggered with a `sleep` so `roscore` and MAVROS are up before dependents start.
+
+**`gcs_tmux`** (run on the GCS) opens a `gcs_stack` tmux session for testing mission logic against the software-in-the-loop emulator, without needing the real UAV:
+
+| Pane | Command |
+|---|---|
+| flight emulator | `roslaunch spar_node spar_uavasr.launch` (spar node + `uavasr_emulator`) |
+| bag recording | `rosbag record -a` (written to `~/catkin_ws/bags/`) |
+| local position monitor | `rostopic echo /mavros/local_position/pose` |
+| vision pose monitor | `rostopic echo /mavros/vision_pose/pose` |
+| rviz | `rviz -d ~/catkin_ws/src/spar/spar_node/rviz/emulator_configuration.rviz`¹ |
+| HUD | `rosrun rqt_generic_hud rqt_generic_hud` |
+| MAVROS GUI | `rosrun rqt_mavros_gui rqt_mavros_gui` |
+| kill switch | `tmux kill-session -t gcs_stack` staged, not run |
+
+¹ This rviz config isn't checked into the repo yet — add `src/spar/spar_node/rviz/emulator_configuration.rviz` before relying on this pane.
+
+`gcs_tmux` uses whatever `ROS_MASTER_URI` is already set (the UAV, by default). For standalone testing against the emulator with no real UAV involved, run `gcs_tmux_sim` instead — it points ROS at yourself first (`disros $(hostname -I)`), then starts the same tmux stack.
 
 **Helper functions**, available in any pane/shell once the ArUco mission node (`demo_ml`) is running:
 

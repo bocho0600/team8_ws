@@ -10,9 +10,12 @@ services:
     # is normally run on the Pi itself.
     network_mode: host
     environment:
-      # The UAV runs roscore, so both machines default to pointing at it.
-      # ROS_IP is left for the container's ros.sh (disros) to auto-detect via
-      # `hostname -I` on each interactive shell.
+      # ROLE picks docker/bashrc.d/uav.sh or gcs.sh (see .env.example).
+      # ROS_MASTER_URI here is just the container-level baseline; each
+      # interactive shell's `disros` (role-specific) sets the real default —
+      # self for the UAV, UAV_IP for the GCS. ROS_IP is left for `disros` to
+      # auto-detect via `hostname -I`.
+      - ROLE=${ROLE:-gcs}
       - ROS_MASTER_URI=http://${UAV_IP:-localhost}:11311
       - ROS_IP=${ROS_IP:-}
       - UAV_IP=${UAV_IP:-}
