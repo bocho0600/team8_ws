@@ -37,8 +37,10 @@ class ArucoDetector():
         self.marker_length = rospy.get_param('~marker_length', 0.2)
 
         # Publisher: annotated image (for viewing in rqt/Rviz)
+        # queue_size=1: live video, so a backlog is never worth keeping -
+        # matching the queue_size=1 on the subscriber below for the same reason.
         self.aruco_pub = rospy.Publisher(
-            '/processed_aruco/image/compressed', CompressedImage, queue_size=10)
+            '/processed_aruco/image/compressed', CompressedImage, queue_size=1)
 
         # Publisher: structured detections (label, id, confidence, 3D position)
         # consumed by NAV for landing-marker selection / waypoint storage.
@@ -189,7 +191,12 @@ class ArucoDetector():
         msg_out = CompressedImage()
         msg_out.header.stamp = rospy.Time.now()
         msg_out.format = "jpeg"
-        msg_out.data = np.array(cv2.imencode('.jpg', frame)[1]).tobytes()
+        # Quality 60 to match the source stream from the depthai node. Left at
+        # the default (95) this re-encode came out heavier than the frame it
+        # was decoded from, so annotating the image cost more bandwidth over
+        # the WiFi link than the original camera feed did.
+        msg_out.data = np.array(
+            cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 60])[1]).tobytes()
 
         self.aruco_pub.publish(msg_out)
 

@@ -64,9 +64,12 @@ class DepthaiCamera():
         if "input_size" in nnConfig:
             self.nn_shape_w, self.nn_shape_h = tuple(map(int, nnConfig.get("input_size").split('x')))
 
-        self.pub_image = rospy.Publisher(self.pub_topic, CompressedImage, queue_size=10)
-        self.pub_image_raw = rospy.Publisher(self.pub_topic_raw, Image, queue_size=10)
-        self.pub_image_detect = rospy.Publisher(self.pub_topic_detect, CompressedImage, queue_size=10)
+        # queue_size=1 on the image streams: these are live video, so a
+        # backlog is never worth keeping. At 10fps a depth of 10 buys up to a
+        # second of extra lag whenever the link can't keep up.
+        self.pub_image = rospy.Publisher(self.pub_topic, CompressedImage, queue_size=1)
+        self.pub_image_raw = rospy.Publisher(self.pub_topic_raw, Image, queue_size=1)
+        self.pub_image_detect = rospy.Publisher(self.pub_topic_detect, CompressedImage, queue_size=1)
         self.pub_cam_inf = rospy.Publisher(self.pub_topic_cam_inf, CameraInfo, queue_size=10)
         self.pub_targets = rospy.Publisher(self.pub_topic_targets, TargetDetectionArray, queue_size=10)
 
@@ -148,8 +151,15 @@ class DepthaiCamera():
 
                 device.startPipeline(pipeline)
 
-                q_nn_input = device.getOutputQueue(name="nn_input", maxSize=4, blocking=False)
-                q_nn = device.getOutputQueue(name="nn", maxSize=4, blocking=False)
+                # maxSize=1, not 4. These are non-blocking queues, so a full
+                # queue overwrites the oldest entry - but get() still returns
+                # the oldest one held. With a depth of 4 and a host loop that
+                # can't keep up with 10fps, the queue sits permanently full and
+                # every frame read is ~4 frames (~400ms) stale, forever. Depth
+                # 1 means "always the newest frame", trading dropped frames for
+                # latency, which is the right trade for flight.
+                q_nn_input = device.getOutputQueue(name="nn_input", maxSize=1, blocking=False)
+                q_nn = device.getOutputQueue(name="nn", maxSize=1, blocking=False)
 
                 frame = None
                 detections = []
@@ -210,6 +220,14 @@ class DepthaiCamera():
         msg_out.header.frame_id = "home"
         msg_out.data = np.array(cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 60])[1]).tobytes()
         self.pub_image.publish(msg_out)
+
+        # The uncompressed stream is 640*640*3 = 1.2MB per frame, ~98Mbps at
+        # 10fps - enough to saturate the WiFi link to the GCS on its own and
+        # push every other topic into a backlog. Only pay for it (both the
+        # tobytes() copy and the bandwidth) when something is actually
+        # listening. Prefer the /compressed topic for viewing.
+        if self.pub_image_raw.get_num_connections() == 0:
+            return
 
         # NOTE: cv_bridge's cv2_to_imgmsg() hits a KeyError on some
         # ROS Noetic + numpy combinations (numpy dtype hashing changed in
