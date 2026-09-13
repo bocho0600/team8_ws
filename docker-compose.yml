@@ -30,6 +30,10 @@ services:
       # whenever package.xml/CMakeLists dependencies change.
       - ./catkin_ws/src:/home/uavteam8/catkin_ws/src
       - ./catkin_ws/launch:/home/uavteam8/catkin_ws/launch
+      # Same idea for the shell helpers (disros, the tmux launchers, the aruco
+      # helpers): shadows the copy baked into the image so editing them takes
+      # effect in the next shell, no rebuild. Host uid 1000 matches uavteam8.
+      - ./docker/bashrc.d:/home/uavteam8/.bashrc.d:ro
       # X11 socket, for rqt_*/rviz GUI tools.
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
     # Uncomment on the UAV for the flight controller's serial port. The Pi's

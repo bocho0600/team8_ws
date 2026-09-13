@@ -266,7 +266,12 @@ Docker picks the right architecture automatically. To use it instead of building
 
 - The image is based on `ros:noetic-perception`, which publishes amd64 **and** arm64 — the `osrf/ros:noetic-desktop-*` tags are amd64-only and cannot be built on the Pi. rviz and the rqt plugins are apt-installed on top instead of coming from the base.
 - `network_mode: host` is used so mavros/GCS/vrpn can reach other machines on the LAN, the same as running directly on the Pi.
-- `./src` and `./launch` are bind-mounted, so source edits on the host are picked up without rebuilding — rebuild (`docker compose build`) whenever a `package.xml` or `CMakeLists.txt` dependency changes.
+- `./src` and `./launch` are bind-mounted, so host edits are picked up without rebuilding the image. What each kind of change actually costs:
+  - **Launch/YAML files** — nothing; they're read at `roslaunch` time. Restart the node.
+  - **Python nodes** — nothing; `catkin_install_python` puts a relay stub in `devel/lib/<pkg>/` that `exec`s the mounted source file at runtime, so it always runs your current copy. Restart the node.
+  - **C++ nodes** — `catkin_make` inside the container (not an image rebuild). Use a persistent container (`docker compose up -d` + `docker compose exec catkin_ws bash`) so `devel/` survives; `docker compose run --rm` discards the compile on exit.
+  - **`package.xml` / `CMakeLists.txt` dependencies** — `docker compose build`, since new apt/rosdep packages have to be installed into the image.
+- `./docker/bashrc.d` is bind-mounted read-only over the copy baked into the image, so edits to the shell helpers (`disros`, `run_uav_stack`/`gcs_tmux`, the aruco/servo helpers) apply in the *next* shell — no rebuild, but existing shells and their tmux panes keep the old definitions until you exit and re-enter.
 - Serial devices (flight controller, etc.) are commented out in [`docker-compose.yml`](docker-compose.yml) by default — see step 2 of the [UAV setup](#on-the-uav-raspberry-pi) above.
 - `RPi.GPIO` (used by `actuator_control`) is skipped during the image's `rosdep install` since it only installs against real Raspberry Pi hardware — that package still builds, it just can't drive real GPIO pins from inside the container. `fake-rpi` is installed for anyone who wants to `import RPi.GPIO` for off-Pi simulation.
 
