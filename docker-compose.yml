@@ -36,6 +36,15 @@ services:
       - ./docker/bashrc.d:/home/uavteam8/.bashrc.d:ro
       # X11 socket, for rqt_*/rviz GUI tools.
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      # The OAK-D camera. `privileged: true` alone is NOT enough: the
+      # container's /dev is a tmpfs populated once at startup, so it's a
+      # snapshot, not a live view. depthai boots the camera by uploading
+      # firmware, after which the device re-enumerates under a new USB
+      # address -- which never appears in that snapshot. The result is
+      # "Failed to find device after booting: X_LINK_DEVICE_NOT_FOUND",
+      # then "No available devices" forever. Bind-mounting the host's real
+      # USB tree lets the container follow the re-enumeration.
+      - /dev/bus/usb:/dev/bus/usb
     # Uncomment on the UAV for the flight controller's serial port. The Pi's
     # GPIO UART is /dev/ttyAMA1, matching control.launch's fcu_url default;
     # a USB-attached FCU shows up as /dev/ttyUSB0 or /dev/ttyACM0 instead.
