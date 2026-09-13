@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 import math
 
@@ -16,16 +16,31 @@ camera_name = "camera"
 
 def send_tf_camera():
 	# Create a static transform that is slightly
-	# below the UAV and pointing downwards
+	# below the UAV and pointing downwards.
+	#
+	# The mount geometry is exposed as private params so it can be re-measured
+	# or the camera re-clocked without editing code, e.g. in a launch file:
+	#   <param name="camera_yaw_deg" value="-90"/>
+	# Defaults reproduce the original hardcoded mount exactly.
 	t = TransformStamped()
 	t.header.stamp = rospy.Time.now()
-	t.header.frame_id = uav_name
-	t.child_frame_id = camera_name
+	t.header.frame_id = rospy.get_param('~uav_frame', uav_name)
+	t.child_frame_id = rospy.get_param('~camera_frame', camera_name)
 
-	t.transform.translation.x = 0.1
-	t.transform.translation.y = 0.0
-	t.transform.translation.z = -0.15
-	q = tf_conversions.transformations.quaternion_from_euler(0, math.pi, 0)
+	t.transform.translation.x = rospy.get_param('~camera_x', 0.1)
+	t.transform.translation.y = rospy.get_param('~camera_y', 0.0)
+	t.transform.translation.z = rospy.get_param('~camera_z', -0.15)
+
+	# quaternion_from_euler defaults to 'sxyz': static/extrinsic axes, applied
+	# x then y then z about the PARENT (UAV) frame. The pi about y is what
+	# points the camera down; the yaw then spins it about the UAV's z.
+	#
+	# Sign trap: because the camera looks down, its optical z points opposite
+	# the UAV's z. A yaw of -90 here is -90 about the UAV's z, which reads as
+	# +90 when looking through the lens. Negate it if you're matching what you
+	# see in the image rather than the airframe.
+	yaw = math.radians(rospy.get_param('~camera_yaw_deg', 0.0))
+	q = tf_conversions.transformations.quaternion_from_euler(0, math.pi, yaw)
 	t.transform.rotation.x = q[0]
 	t.transform.rotation.y = q[1]
 	t.transform.rotation.z = q[2]
