@@ -9,18 +9,23 @@ import numpy as np
 
 from image_processing.msg import TargetDetection, TargetDetectionArray
 
+# OpenCV 4.7 replaced the free-function ArUco API with the ArucoDetector class
+# and renamed DetectorParameters_create() -> DetectorParameters(); 5.0 deleted
+# the old one outright. This node was written against 5.0, but ROS Noetic ships
+# OpenCV 4.2, which only has the old API - and cv_bridge is compiled against
+# that 4.2, so upgrading it out from under ROS is not an option. Support both
+# rather than pinning to either.
+_HAS_ARUCO_DETECTOR = hasattr(cv2.aruco, 'ArucoDetector')
+
 
 class ArucoDetector():
-    # ArUco dictionary and parameters
-    # Confirmed running on OpenCV 5.0.0, which removed the entire legacy
-    # ArUco free-function API. This class now uses the ArucoDetector class API
-    # throughout (detection, dictionary, params) plus solvePnP/drawFrameAxes
-    # for pose estimation, none of which depend on removed functions.
-    # OpenCV 5.0 removed the old free-function ArUco API entirely
-    # (Dictionary_get, DetectorParameters_create, and the free-function
-    # detectMarkers) in favour of this ArucoDetector class.
+    # ArUco dictionary and parameters. Everything else this node uses
+    # (solvePnP, drawFrameAxes, polylines) is present in both versions.
     aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_5X5_100)
-    aruco_params = cv2.aruco.DetectorParameters()
+    if _HAS_ARUCO_DETECTOR:
+        aruco_params = cv2.aruco.DetectorParameters()
+    else:
+        aruco_params = cv2.aruco.DetectorParameters_create()
 
     frame_sub_topic = '/depthai_node/image/compressed'
     cam_info_topic = '/depthai_node/camera/camera_info'
@@ -43,8 +48,11 @@ class ArucoDetector():
         # OpenCV bridge to convert ROS images
         self.br = CvBridge()
 
-        # Built once and reused every frame, rather than rebuilt each call
-        self.detector = cv2.aruco.ArucoDetector(self.aruco_dict, self.aruco_params)
+        # Built once and reused every frame, rather than rebuilt each call.
+        # Only the 4.7+ class API has an object to build; on 4.2 there is
+        # nothing to hold onto and detect_markers() calls the free function.
+        self.detector = (cv2.aruco.ArucoDetector(self.aruco_dict, self.aruco_params)
+                         if _HAS_ARUCO_DETECTOR else None)
 
         # Camera calibration - populated from the real CameraInfo topic instead
         # of hardcoded placeholder values. Starts as None; detection is skipped
@@ -125,10 +133,17 @@ class ArucoDetector():
 
         return rvec, tvec
 
+    def detect_markers(self, frame):
+        """Detect markers through whichever ArUco API this OpenCV provides."""
+        if self.detector is not None:
+            return self.detector.detectMarkers(frame)
+        return cv2.aruco.detectMarkers(
+            frame, self.aruco_dict, parameters=self.aruco_params)
+
     def find_aruco(self, frame):
         detections = []
 
-        (corners, ids, _) = self.detector.detectMarkers(frame)
+        (corners, ids, _) = self.detect_markers(frame)
 
         if len(corners) > 0:
             ids = ids.flatten()

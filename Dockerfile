@@ -23,12 +23,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ros-noetic-mavros-extras \
         ros-noetic-vrpn-client-ros \
         ros-noetic-topic-tools \
+        ros-noetic-tf-conversions \
         ros-noetic-rviz \
         ros-noetic-rqt-gui \
         ros-noetic-rqt-gui-py \
         ros-noetic-rqt-py-common \
         ros-noetic-image-transport-plugins \
         python3-matplotlib \
+        python3-pigpio \
         tmux \
         htop \
     && rm -rf /var/lib/apt/lists/*
@@ -59,6 +61,14 @@ RUN . /opt/ros/noetic/setup.sh \
 # it just can't be run for real outside a Pi. fake-rpi is available for
 # anyone who wants to import RPi.GPIO for off-Pi simulation.
 RUN pip3 install fake-rpi
+
+# depthai drives the OAK-D camera (dai_publisher_yolov11_runner.py). Only
+# useful on the Pi with the camera attached, but it has to import everywhere
+# or combined_nodes.launch loses the node outright. --only-binary matters:
+# without it pip falls back to the source tarball and compiles the whole C++
+# SDK, which turns a 14MB download into a very long build on the Pi. Wheels
+# exist for both x86_64 and aarch64.
+RUN pip3 install --only-binary=:all: depthai
 
 COPY --chown=$USER_UID:$USER_GID catkin_ws/ .
 RUN chown -R $USER_UID:$USER_GID $CATKIN_WS

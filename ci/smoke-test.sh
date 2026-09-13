@@ -90,6 +90,28 @@ expect "rqt plugin modules import" "ok" gcs \
          python3 -c "import $m" 2>/dev/null || exit 1
      done; echo ok'
 
+# These are imported at module scope, so a missing one doesn't degrade the node
+# -- it kills it, and combined_nodes.launch comes up short a node. `rosdep
+# install -r` will NOT catch that: it continues past unresolvable keys (it can't
+# resolve tf_conversions at all), so these are installed explicitly.
+echo "- node runtime imports"
+expect "hardware/TF python modules present" "ok" uav \
+    'for m in depthai pigpio tf_conversions; do python3 -c "import $m" 2>/dev/null || exit 1; done; echo ok'
+# aruco_subscriber.py was written against the OpenCV 4.7+/5.0 ArucoDetector API;
+# Noetic ships 4.2, which only has the free-function API. It must work on both.
+expect "aruco detector builds on this OpenCV" "ok" uav \
+    'python3 - <<'"'"'PY'"'"'
+import importlib.util, numpy as np, os
+p = os.environ["CATKIN_WS"] + "/src/image_processing/scripts/aruco_subscriber.py"
+s = importlib.util.spec_from_file_location("aruco_subscriber", p)
+m = importlib.util.module_from_spec(s); s.loader.exec_module(m)
+d = m.ArucoDetector.__new__(m.ArucoDetector)
+d.detector = (__import__("cv2").aruco.ArucoDetector(m.ArucoDetector.aruco_dict,
+              m.ArucoDetector.aruco_params) if m._HAS_ARUCO_DETECTOR else None)
+d.detect_markers(np.zeros((240, 320, 3), dtype=np.uint8))
+print("ok")
+PY'
+
 echo "- tmux launchers are usable"
 expect "tmux present" "tmux" uav 'command -v tmux'
 # Regression guard: the kill-switch pane must be sent WITHOUT a C-m, or the
