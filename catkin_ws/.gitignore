@@ -1,0 +1,28 @@
+# Catkin generated directories
+/build/
+/devel/
+/install/
+/logs/
+
+# If using catkin_tools instead of catkin_make
+/.catkin_tools/
+
+# Catkin workspace marker file (regenerated automatically)
+.catkin_workspace
+
+# ROS bag files (usually large — track separately or with git-lfs/git-annex if needed)
+*.bag
+
+# Python
+__pycache__/
+*.pyc
+
+# Editor/IDE cruft
+.vscode/
+.idea/
+*.swp
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake

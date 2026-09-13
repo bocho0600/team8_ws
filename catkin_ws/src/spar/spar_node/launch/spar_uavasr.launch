@@ -1,0 +1,55 @@
+<?xml version='1.0'?>
+<launch>
+	<!-- Emulator Parameters -->
+	<arg name="uav_name" default="uavteam8"/>
+
+	<!-- Fake marker positions (map frame, metres). Both sit on the
+	     ground (z=0) inside the scan pattern's -2.5..2.5 bounds. -->
+	<arg name="marker_7_xyz"  default="1.5 2.0 0"/>
+	<arg name="marker_12_xyz" default="-2.0 -1.5 0"/>
+
+	<!-- Spar Node -->
+	<remap from="spar/mav_state" to="uavasr/state"/>
+	<remap from="spar/pose" to="uavasr/pose"/>
+	<remap from="uavasr/odom" to="/mavros/vision_pose/pose"/>
+	<remap from="spar/setpoint" to="uavasr/setpoint_raw/local"/>
+	<include file="$(find spar_node)/launch/spar.launch"/>
+
+	<!-- Emulator Node -->
+	<node pkg="uavasr_emulator" type="uavasr_emulator_node" name="uavasr" clear_params="true" output="screen">
+		<!-- Operational Parameters -->
+		<param name="frame_id" value="map" type="str"/>
+		<param name="model_id" value="$(arg uav_name)" type="str"/>
+
+		<param name="start_armed" value="true" type="bool"/>
+		<param name="start_mode_offboard" value="true" type="bool"/>
+
+		<param name="update_rate_pose" value="50.0" type="double"/>
+		<param name="update_rate_battery" value="1.0" type="double"/>
+		<param name="update_rate_state" value="1.0" type="double"/>
+	</node>
+
+	<!-- ============================================================
+	     Fake ArUco marker frames (TESTING ONLY)
+
+	     These are static children of map, so they are always in the
+	     TF tree - unlike real target_aruco_* frames, which only exist
+	     while the marker is actually in the camera's view.
+
+	     nav_prod_aruco's resolve_frame() checks its detection cache
+	     first and falls back to a TF lookup, so these resolve through
+	     the fallback path. That exercises the service, navigation and
+	     landing logic, but NOT the detection -> transform -> averaging
+	     path. Remove this block before flying for real.
+
+	     Args are "x y z yaw pitch roll parent child".
+	     ============================================================ -->
+
+	<node pkg="tf2_ros" type="static_transform_publisher" name="fake_aruco_7"
+	      args="$(arg marker_7_xyz) 0 0 0 map target_aruco_7"
+	      output="screen"/>
+
+	<node pkg="tf2_ros" type="static_transform_publisher" name="fake_aruco_12"
+	      args="$(arg marker_12_xyz) 0 0 0 map target_aruco_12"
+	      output="screen"/>
+</launch>

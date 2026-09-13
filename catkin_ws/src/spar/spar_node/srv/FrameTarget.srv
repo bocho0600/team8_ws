@@ -1,0 +1,15 @@
+# Request: the name of the frame to fly to.
+#
+# Accepts either:
+#   - a detected target frame, e.g. "target_aruco_7"
+#     (resolved from the averaged map-frame estimate built by
+#      detection_callback, NOT by a live TF lookup - target_* frames
+#      only exist in TF while the marker is actually in view)
+#   - any frame that is genuinely in the TF tree, e.g. "home"
+string frame
+---
+# Response: whether the request was accepted onto the queue.
+# NOTE: success=True means "queued", not "flight complete". The
+# flight itself happens on the main thread afterwards.
+bool success
+string message

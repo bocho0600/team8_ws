@@ -1,0 +1,32 @@
+services:
+  catkin_ws:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: uavteam8/catkin_ws:latest
+    container_name: uavteam8_catkin_ws
+    # Host networking makes mavros/GCS/vrpn discovery on the LAN and talking
+    # to other ROS_MASTER_URI machines trivial, matching how this workspace
+    # is normally run on the Pi itself.
+    network_mode: host
+    environment:
+      - ROS_MASTER_URI=${ROS_MASTER_URI:-http://localhost:11311}
+      - ROS_IP=${ROS_IP:-}
+      - DISPLAY=${DISPLAY}
+      - QT_X11_NO_MITSHM=1
+    volumes:
+      # Live-edit source without rebuilding the image; rebuild the image
+      # whenever package.xml/CMakeLists dependencies change.
+      - ./catkin_ws/src:/home/uavteam8/catkin_ws/src
+      - ./catkin_ws/launch:/home/uavteam8/catkin_ws/launch
+      # X11 socket, for rqt_*/rviz GUI tools.
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+    # Uncomment and adjust for whatever serial device the flight controller
+    # (mavros fcu_url) or other peripherals enumerate as on your host.
+    # devices:
+    #   - /dev/ttyUSB0:/dev/ttyUSB0
+    #   - /dev/ttyACM0:/dev/ttyACM0
+    privileged: true
+    stdin_open: true
+    tty: true
+    command: bash

@@ -1,0 +1,14 @@
+**/.git
+catkin_ws/build/
+catkin_ws/devel/
+catkin_ws/install/
+catkin_ws/logs/
+catkin_ws/.catkin_tools/
+.claude/
+docker/.cache/
+*.bag
+__pycache__/
+*.py[cod]
+.vscode/
+.idea/
+*.swp

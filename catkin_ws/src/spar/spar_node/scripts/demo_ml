@@ -1,0 +1,2187 @@
+#!/usr/bin/env python3
+
+import sys
+import threading
+from math import *
+
+import rospy
+import actionlib
+
+import tf2_ros
+import tf2_geometry_msgs  # noqa: F401 - registers PointStamped transform support
+
+from actionlib_msgs.msg import GoalStatus
+
+from spar_msgs.msg import FlightMotionAction, FlightMotionGoal
+from breadcrumb.srv import RequestPath
+
+from spar_node.srv import FrameTarget, FrameTargetResponse
+
+from nav_msgs.msg import Path
+from std_msgs.msg import Bool
+from geometry_msgs.msg import PoseStamped, Point, PointStamped
+
+from image_processing.msg import TargetDetectionArray
+
+
+# ============================================================
+# Shared mission state
+#
+# The detection subscriber, the service handlers, the request
+# topics and the main thread all touch this state, so it is
+# only read/written while holding state_lock.
+# ============================================================
+
+state_lock = threading.Lock()
+
+# Position the script believes the UAV actually reached.
+current_mission_position = None
+
+# Set True once the scan pattern has finished. Requests that
+# arrive before this are rejected so nothing fights the scan
+# loop for the action client.
+scan_complete = False
+
+# frame_name -> {"sum": [x, y, z], "count": n, "last": rospy.Time}
+# Positions are stored in the map frame, as a running mean.
+#
+# Keyed by TF frame name (e.g. "target_aruco_7") rather than by
+# marker ID, because that is what the services take as an
+# argument and it also covers YOLO targets ("target_person").
+frame_estimates = {}
+
+# Frames whose actuator has already been fired. Once a target is
+# in here it is ignored for the rest of the mission - the lawnmower
+# scan will very often re-see the same person/backpack from a later
+# pass, and it must not divert twice.
+handled_targets = set()
+
+# Diversion targets waiting to be flown to, oldest first. Appended
+# by the detection callback, drained by the scan loop.
+pending_diversions = []
+
+# Queued work for the main thread. One of:
+#   None
+#   ("land",       frame_name)
+#   ("roi",        frame_name)
+#   ("land_point", [x, y, z])
+pending_request = None
+
+# TF
+tf_buffer = None
+
+# Cached parameters (the detection callback runs at camera rate,
+# so it must not hit the parameter server per frame).
+MAP_FRAME = "map"
+CAMERA_FRAME = ""
+MARKER_OUTLIER_DISTANCE = 1.0
+MARKER_MIN_OBSERVATIONS = 3
+
+# Altitude the UAV transits at when approaching a target. Kept
+# above the target's own (ground-level, noisiest) z estimate.
+APPROACH_HEIGHT = 2.0
+
+# Altitude for the "roi" action - descend to here and hold.
+ROI_HEIGHT = 1.5
+
+# Seconds to hold station over a diversion target after firing the
+# actuator, before resuming the scan.
+ACTUATOR_HOLD = 2.0
+
+# True  -> resolve_frame() uses a live map -> frame TF lookup first,
+#          falling back to the averaged detection estimate.
+# False -> the reverse.
+PREFER_TF = True
+
+# ------------------------------------------------------------
+# Mid-scan diversion targets.
+#
+# YOLO class label -> value published on the actuator topic.
+#
+# These are the raw labels from /target_detections/yolo, NOT frame
+# names: person/backpack detections are handled straight off the
+# topic and never go through TF. Check the labels your model emits
+# with:
+#     rostopic echo /target_detections/yolo | grep label
+# ------------------------------------------------------------
+
+DIVERSION_ACTUATOR = {
+    "person":   True,
+    "backpack": False,
+}
+
+
+# ============================================================
+# Send GOTO waypoint
+# ============================================================
+
+def send_wp(
+        spar_client,
+        x,
+        y,
+        z,
+        yaw,
+        wait_time=2.0):
+
+    speed = rospy.get_param(
+        "~speed",
+        1.0
+    )
+
+    accuracy = rospy.get_param(
+        "~accuracy",
+        0.1
+    )
+
+    goal = FlightMotionGoal()
+    goal.motion = FlightMotionGoal.MOTION_GOTO
+
+    goal.position.x = x
+    goal.position.y = y
+    goal.position.z = z
+    goal.yaw = yaw
+
+    goal.velocity_vertical = speed
+    goal.velocity_horizontal = speed
+    goal.yawrate = speed
+
+    goal.wait_for_convergence = True
+    goal.position_radius = accuracy
+    goal.yaw_range = accuracy
+
+    rospy.loginfo(
+        "Sending waypoint: [%.2f, %.2f, %.2f]",
+        x,
+        y,
+        z
+    )
+
+    spar_client.send_goal(goal)
+
+    spar_client.wait_for_result()
+
+    state = spar_client.get_state()
+
+    if state != GoalStatus.SUCCEEDED:
+
+        rospy.logerr(
+            "Waypoint failed. Action state: %d",
+            state
+        )
+
+        return False
+
+    if wait_time > 0.0:
+        rospy.sleep(wait_time)
+
+    return True
+
+
+def yolo_callback(msg):
+    """Queue an actuator drop the first time a target label appears.
+
+    Deliberately does NOT touch TF. person/backpack detections are
+    acted on where the UAV is standing, so there is nothing to
+    transform into the map frame - which also means this path is
+    immune to a wrong camera mount transform.
+    """
+
+    for detection in msg.detections:
+
+        label = detection.label
+
+        if label not in DIVERSION_ACTUATOR:
+            continue
+
+        with state_lock:
+
+            if label in handled_targets:
+                continue
+
+            if label in pending_diversions:
+                continue
+
+            pending_diversions.append(label)
+
+            rospy.loginfo(
+                "Diversion QUEUED for '%s' (confidence %.2f).",
+                label,
+                detection.confidence
+            )
+
+
+def has_pending_diversion():
+    """True if a diversion is waiting. Does not consume it."""
+
+    with state_lock:
+        return bool(pending_diversions)
+
+
+def send_wp_scan(
+        spar_client,
+        x,
+        y,
+        z,
+        yaw):
+    """Fly to a scan waypoint, abandoning it if a target appears.
+
+    Returns (success, interrupted).
+
+    Unlike send_wp(), this polls instead of blocking on
+    wait_for_result(), so a detection arriving mid-leg can cancel the
+    goal and stop the UAV where it is rather than at the end of the
+    leg.
+    """
+
+    speed = rospy.get_param(
+        "~speed",
+        1.0
+    )
+
+    accuracy = rospy.get_param(
+        "~accuracy",
+        0.1
+    )
+
+    goal = FlightMotionGoal()
+    goal.motion = FlightMotionGoal.MOTION_GOTO
+
+    goal.position.x = x
+    goal.position.y = y
+    goal.position.z = z
+    goal.yaw = yaw
+
+    goal.velocity_vertical = speed
+    goal.velocity_horizontal = speed
+    goal.yawrate = speed
+
+    goal.wait_for_convergence = True
+    goal.position_radius = accuracy
+    goal.yaw_range = accuracy
+
+    rospy.loginfo(
+        "Sending waypoint: [%.2f, %.2f, %.2f]",
+        x,
+        y,
+        z
+    )
+
+    spar_client.send_goal(goal)
+
+    poll = rospy.Duration(0.1)
+
+    while not rospy.is_shutdown():
+
+        if spar_client.wait_for_result(poll):
+            break
+
+        if has_pending_diversion():
+
+            rospy.logwarn(
+                "Target detected mid-leg - cancelling waypoint and "
+                "stopping here."
+            )
+
+            spar_client.cancel_goal()
+
+            # Give SPAR a moment to act on the cancel and settle.
+            rospy.sleep(0.5)
+
+            return True, True
+
+    if rospy.is_shutdown():
+        return False, False
+
+    state = spar_client.get_state()
+
+    if state != GoalStatus.SUCCEEDED:
+
+        rospy.logerr(
+            "Waypoint failed. Action state: %d",
+            state
+        )
+
+        return False, False
+
+    return True, False
+
+
+# ============================================================
+# Request Breadcrumb path
+# ============================================================
+
+def get_breadcrumb_path(
+        srvc_bc,
+        start,
+        end):
+
+    req = RequestPath._request_class()
+
+    req.start.x = start[0]
+    req.start.y = start[1]
+    req.start.z = start[2]
+
+    req.end.x = end[0]
+    req.end.y = end[1]
+    req.end.z = end[2]
+
+    rospy.loginfo(
+        "Requesting Breadcrumb path:"
+    )
+
+    rospy.loginfo(
+        "    Start: [%.2f, %.2f, %.2f]",
+        req.start.x,
+        req.start.y,
+        req.start.z
+    )
+
+    rospy.loginfo(
+        "    End:   [%.2f, %.2f, %.2f]",
+        req.end.x,
+        req.end.y,
+        req.end.z
+    )
+
+    try:
+
+        res = srvc_bc(req)
+
+    except rospy.ServiceException as e:
+
+        rospy.logerr(
+            "Breadcrumb service call failed: %s",
+            e
+        )
+
+        return []
+
+    if len(res.path.poses) == 0:
+
+        rospy.logwarn(
+            "Breadcrumb returned NO PATH."
+        )
+
+        return []
+
+    rospy.loginfo(
+        "Breadcrumb returned %d poses.",
+        len(res.path.poses)
+    )
+
+    return res.path.poses
+
+
+# ============================================================
+# Find nearby valid waypoint
+# ============================================================
+
+def find_nearby_valid_waypoint(
+        srvc_bc,
+        start,
+        target):
+
+    step = rospy.get_param(
+        "~fallback_step",
+        0.25
+    )
+
+    max_radius = rospy.get_param(
+        "~fallback_max_radius",
+        1.0
+    )
+
+    yaw = target[3]
+
+    rospy.logwarn(
+        "Searching for alternative waypoint near "
+        "[%.2f, %.2f, %.2f]",
+        target[0],
+        target[1],
+        target[2]
+    )
+
+    directions = [
+        ( 1.0,  0.0),
+        (-1.0,  0.0),
+        ( 0.0,  1.0),
+        ( 0.0, -1.0),
+
+        ( 1.0,  1.0),
+        ( 1.0, -1.0),
+        (-1.0,  1.0),
+        (-1.0, -1.0),
+    ]
+
+    radius = step
+
+    while radius <= max_radius + 1e-6:
+
+        rospy.loginfo(
+            "Trying fallback radius: %.2f m",
+            radius
+        )
+
+        for dx, dy in directions:
+
+            candidate = [
+                target[0] + dx * radius,
+                target[1] + dy * radius,
+                target[2]
+            ]
+
+            rospy.loginfo(
+                "Testing candidate: "
+                "[%.2f, %.2f, %.2f]",
+                candidate[0],
+                candidate[1],
+                candidate[2]
+            )
+
+            candidate_path = get_breadcrumb_path(
+                srvc_bc,
+                start,
+                candidate
+            )
+
+            if len(candidate_path) > 0:
+
+                candidate_wp = [
+                    candidate[0],
+                    candidate[1],
+                    candidate[2],
+                    yaw
+                ]
+
+                rospy.loginfo(
+                    "Found valid fallback waypoint: "
+                    "[%.2f, %.2f, %.2f]",
+                    candidate_wp[0],
+                    candidate_wp[1],
+                    candidate_wp[2]
+                )
+
+                return candidate_wp, candidate_path
+
+        radius += step
+
+    rospy.logerr(
+        "Could not find a valid fallback waypoint "
+        "within %.2f m.",
+        max_radius
+    )
+
+    return None, []
+
+
+# ============================================================
+# Publish nav_msgs/Path
+# ============================================================
+
+def publish_path(
+        path_pub,
+        breadcrumb_path):
+
+    path_msg = Path()
+
+    path_msg.header.stamp = rospy.Time.now()
+    path_msg.header.frame_id = MAP_FRAME
+
+    for pose in breadcrumb_path:
+
+        path_pose = PoseStamped()
+
+        path_pose.header.stamp = path_msg.header.stamp
+        path_pose.header.frame_id = MAP_FRAME
+
+        path_pose.pose = pose
+
+        path_msg.poses.append(
+            path_pose
+        )
+
+    path_pub.publish(path_msg)
+
+    rospy.loginfo(
+        "Published /path with %d poses.",
+        len(path_msg.poses)
+    )
+
+
+# ============================================================
+# Follow Breadcrumb path
+# ============================================================
+
+def follow_breadcrumb_path(
+        spar_client,
+        breadcrumb_path,
+        yaw):
+
+    for i, pose in enumerate(breadcrumb_path):
+
+        x = pose.position.x
+        y = pose.position.y
+        z = pose.position.z
+
+        rospy.loginfo(
+            "Breadcrumb point %d/%d: "
+            "[%.2f, %.2f, %.2f]",
+
+            i + 1,
+            len(breadcrumb_path),
+
+            x,
+            y,
+            z
+        )
+
+        success = send_wp(
+            spar_client,
+            x,
+            y,
+            z,
+            yaw,
+            wait_time=0.0
+        )
+
+        if not success:
+
+            rospy.logerr(
+                "Failed while following Breadcrumb path."
+            )
+
+            return False
+
+    return True
+
+
+# ============================================================
+# Land
+# ============================================================
+
+def land(spar_client):
+
+    goal = FlightMotionGoal()
+
+    goal.motion = FlightMotionGoal.MOTION_LAND
+
+    goal.velocity_vertical = rospy.get_param(
+        "~landing_speed",
+        0.2
+    )
+
+    rospy.loginfo(
+        "Sending landing command..."
+    )
+
+    spar_client.send_goal(goal)
+
+    spar_client.wait_for_result()
+
+    state = spar_client.get_state()
+
+    if state == GoalStatus.SUCCEEDED:
+
+        rospy.loginfo(
+            "Landing complete!"
+        )
+
+        return True
+
+    rospy.logerr(
+        "Landing failed. Action state: %d",
+        state
+    )
+
+    return False
+
+
+# ============================================================
+# Detection handling
+#
+# /target_detections/aruco  (ArUco markers)
+# /target_detections/yolo   (person / backpack)
+# image_processing/TargetDetectionArray
+#
+# detection.position is the target in the CAMERA OPTICAL frame
+# (metres, x right / y down / z forward). It must be pushed
+# through TF into the map frame before it means anything to
+# Breadcrumb or SPAR.
+# ============================================================
+
+def frame_name_for(detection):
+    """Build the TF frame name for a detection.
+
+    MUST match target_tf2_broadcaster.py's naming scheme, since that
+    name is what a service caller passes in.
+
+    Keyed off the label rather than marker_id: an unset int32 field
+    defaults to 0, not -1, so a YOLO detection with no explicit
+    marker_id would otherwise be named "target_aruco_0".
+    """
+
+    if detection.label == "aruco":
+        return "target_aruco_{}".format(detection.marker_id)
+
+    return "target_{}".format(detection.label)
+
+
+def detection_callback(msg):
+
+    if tf_buffer is None:
+        return
+
+    for detection in msg.detections:
+
+        source_frame = msg.header.frame_id
+
+        if not source_frame:
+            source_frame = CAMERA_FRAME
+
+        if not source_frame:
+
+            rospy.logwarn_throttle(
+                5.0,
+                "Detection has no frame_id and ~camera_frame "
+                "is not set - cannot transform to %s.",
+                MAP_FRAME
+            )
+
+            return
+
+        point_cam = PointStamped()
+
+        point_cam.header.stamp = msg.header.stamp
+        point_cam.header.frame_id = source_frame
+
+        point_cam.point = detection.position
+
+        try:
+
+            point_map = tf_buffer.transform(
+                point_cam,
+                MAP_FRAME,
+                rospy.Duration(0.2)
+            )
+
+        except tf2_ros.TransformException as e:
+
+            rospy.logwarn_throttle(
+                5.0,
+                "Could not transform detection from %s to %s: %s",
+                source_frame,
+                MAP_FRAME,
+                e
+            )
+
+            return
+
+        update_frame_estimate(
+            frame_name_for(detection),
+
+            [
+                point_map.point.x,
+                point_map.point.y,
+                point_map.point.z
+            ]
+        )
+
+
+def take_pending_diversion():
+    """Pop the next unhandled diversion target, or None."""
+
+    with state_lock:
+
+        while pending_diversions:
+
+            frame_name = pending_diversions.pop(0)
+
+            if frame_name in handled_targets:
+                continue
+
+            return frame_name
+
+    return None
+
+
+def update_frame_estimate(frame_name, position):
+
+    with state_lock:
+
+        entry = frame_estimates.get(frame_name)
+
+        if entry is None:
+
+            frame_estimates[frame_name] = {
+                "sum": list(position),
+                "count": 1,
+                "last": rospy.Time.now()
+            }
+
+            rospy.loginfo(
+                "NEW target frame '%s' at map "
+                "[%.2f, %.2f, %.2f]",
+
+                frame_name,
+                position[0],
+                position[1],
+                position[2]
+            )
+
+
+
+            return
+
+        count = float(entry["count"])
+
+        mean = [
+            entry["sum"][0] / count,
+            entry["sum"][1] / count,
+            entry["sum"][2] / count
+        ]
+
+        distance = sqrt(
+            (position[0] - mean[0]) ** 2 +
+            (position[1] - mean[1]) ** 2 +
+            (position[2] - mean[2]) ** 2
+        )
+
+        # A bad pose estimate (target at a glancing angle, or at
+        # the very edge of the image) can be metres out. Once we
+        # have a few good observations, throw those away instead
+        # of letting them drag the mean around.
+        if entry["count"] >= MARKER_MIN_OBSERVATIONS and \
+                distance > MARKER_OUTLIER_DISTANCE:
+
+            rospy.logwarn_throttle(
+                5.0,
+                "Rejecting outlier for '%s' "
+                "(%.2f m from current estimate).",
+                frame_name,
+                distance
+            )
+
+            return
+
+        entry["sum"][0] += position[0]
+        entry["sum"][1] += position[1]
+        entry["sum"][2] += position[2]
+
+        entry["count"] += 1
+        entry["last"] = rospy.Time.now()
+
+
+
+
+def _estimate_locked(frame_name):
+    """Return the averaged map-frame position, or None.
+
+    Caller MUST already hold state_lock.
+    """
+
+    entry = frame_estimates.get(frame_name)
+
+    if entry is None:
+        return None
+
+    count = float(entry["count"])
+
+    return [
+        entry["sum"][0] / count,
+        entry["sum"][1] / count,
+        entry["sum"][2] / count
+    ]
+
+
+def resolve_frame(frame_name, prefer_tf=None):
+    """Map-frame position for a frame name, or None.
+
+    prefer_tf=True  -> live map -> frame TF lookup first, averaged
+                       detection estimate as fallback. Matches what
+                       `rosrun tf tf_echo map <frame>` reports, so a
+                       service call flies to a value you can verify
+                       on the command line.
+
+    prefer_tf=False -> averaged detection estimate first. Correct for
+                       anything resolved after the UAV has moved:
+                       target_* frames are children of the camera
+                       frame, and a Time(0) lookup can compose the
+                       target's old camera-relative offset with the
+                       UAV's CURRENT pose, which silently yields a
+                       wrong position rather than an error.
+
+    Defaults to the ~prefer_tf parameter.
+    """
+
+    if prefer_tf is None:
+        prefer_tf = PREFER_TF
+
+    tf_position = _lookup_tf_position(frame_name)
+
+    with state_lock:
+        cache_position = _estimate_locked(frame_name)
+
+    if prefer_tf:
+        first, second = tf_position, cache_position
+        first_name, second_name = "TF", "detection cache"
+    else:
+        first, second = cache_position, tf_position
+        first_name, second_name = "detection cache", "TF"
+
+    # Log a disagreement: it usually means the uavteam8 -> camera
+    # mount transform is wrong, since a correct one makes both
+    # sources agree.
+    if tf_position is not None and cache_position is not None:
+
+        disagreement = sqrt(
+            sum(
+                (tf_position[i] - cache_position[i]) ** 2
+                for i in range(3)
+            )
+        )
+
+        if disagreement > MARKER_OUTLIER_DISTANCE:
+
+            rospy.logwarn(
+                "'%s': TF says [%.2f, %.2f, %.2f] but the detection "
+                "cache says [%.2f, %.2f, %.2f] (%.2f m apart). Using "
+                "%s. Check the camera mount transform.",
+                frame_name,
+                tf_position[0], tf_position[1], tf_position[2],
+                cache_position[0], cache_position[1], cache_position[2],
+                disagreement,
+                first_name
+            )
+
+    if first is not None:
+
+        rospy.loginfo(
+            "Resolved '%s' from %s: [%.2f, %.2f, %.2f]",
+            frame_name,
+            first_name,
+            first[0],
+            first[1],
+            first[2]
+        )
+
+        return first
+
+    if second is not None:
+
+        rospy.loginfo(
+            "Resolved '%s' from %s (fallback): [%.2f, %.2f, %.2f]",
+            frame_name,
+            second_name,
+            second[0],
+            second[1],
+            second[2]
+        )
+
+        return second
+
+    return None
+
+
+def _lookup_tf_position(frame_name):
+    """Live map -> frame_name translation, or None."""
+
+    if tf_buffer is None:
+        return None
+
+    try:
+
+        t = tf_buffer.lookup_transform(
+            MAP_FRAME,
+            frame_name,
+            rospy.Time(0),
+            rospy.Duration(0.5)
+        )
+
+    except tf2_ros.TransformException as e:
+
+        rospy.logwarn_throttle(
+            5.0,
+            "TF cannot resolve '%s': %s",
+            frame_name,
+            e
+        )
+
+        return None
+
+    return [
+        t.transform.translation.x,
+        t.transform.translation.y,
+        t.transform.translation.z
+    ]
+
+
+def log_frame_summary():
+
+    with state_lock:
+
+        if not frame_estimates:
+
+            rospy.logwarn(
+                "No targets were detected during the scan."
+            )
+
+            return
+
+        rospy.loginfo(
+            "Target frames found during scan:"
+        )
+
+        for frame_name in sorted(frame_estimates):
+
+            position = _estimate_locked(frame_name)
+
+            marker = " [handled]" if frame_name in handled_targets else ""
+
+            rospy.loginfo(
+                "    %-22s -> [%.2f, %.2f, %.2f] "
+                "(%d observations)%s",
+
+                frame_name,
+                position[0],
+                position[1],
+                position[2],
+                frame_estimates[frame_name]["count"],
+                marker
+            )
+
+
+# ============================================================
+# Mid-scan diversion
+#
+# Fly to a detected person/backpack, fire the actuator, mark it
+# handled, and return so the scan can resume.
+# ============================================================
+
+def handle_diversion(actuator_pub, label):
+    """Fire the actuator for a detected target, in place.
+
+    No TF, no navigation: send_wp_scan() has already cancelled the
+    waypoint and stopped the UAV, and the target is directly beneath
+    the camera, so the drop happens here. The label is then added to
+    handled_targets and every later sighting is ignored.
+    """
+
+    value = DIVERSION_ACTUATOR[label]
+
+    rospy.loginfo(
+        "================================================"
+    )
+
+    rospy.loginfo(
+        "TARGET '%s' - firing actuator in place: data=%s",
+        label,
+        value
+    )
+
+    rospy.loginfo(
+        "================================================"
+    )
+
+    actuator_pub.publish(Bool(data=value))
+
+    if ACTUATOR_HOLD > 0.0:
+        rospy.sleep(ACTUATOR_HOLD)
+
+    with state_lock:
+        handled_targets.add(label)
+
+    rospy.loginfo(
+        "Drop for '%s' complete - resuming scan.",
+        label
+    )
+
+    return True
+
+
+# ============================================================
+# Request queueing
+#
+# Service handlers run in their own threads. They must NOT fly
+# the UAV themselves, or they would be driving the same action
+# client as the main thread. They only queue work; the main
+# loop executes it.
+#
+# success=True therefore means "queued", not "flight complete".
+# ============================================================
+
+def queue_request(action, frame_name):
+
+    global pending_request
+
+    if not frame_name:
+
+        return FrameTargetResponse(
+            success=False,
+            message="No frame name given."
+        )
+
+    with state_lock:
+
+        if not scan_complete:
+
+            return FrameTargetResponse(
+                success=False,
+                message="Scan is not complete yet."
+            )
+
+        if pending_request is not None:
+
+            return FrameTargetResponse(
+                success=False,
+                message="A request is already in progress."
+            )
+
+    # Resolved outside the lock: resolve_frame() may block for up
+    # to 0.5 s on a TF lookup, and the detection callback needs
+    # the lock at camera rate.
+    position = resolve_frame(frame_name)
+
+    if position is None:
+
+        return FrameTargetResponse(
+            success=False,
+            message=(
+                "Frame '%s' is unknown - not detected during the "
+                "scan and not present in TF." % frame_name
+            )
+        )
+
+    with state_lock:
+
+        # Re-checked: another caller may have queued while we were
+        # resolving.
+        if pending_request is not None:
+
+            return FrameTargetResponse(
+                success=False,
+                message="A request is already in progress."
+            )
+
+        pending_request = (action, frame_name)
+
+    return FrameTargetResponse(
+        success=True,
+        message=(
+            "Accepted '%s' for frame '%s' at [%.2f, %.2f, %.2f]."
+            % (
+                action,
+                frame_name,
+                position[0],
+                position[1],
+                position[2]
+            )
+        )
+    )
+
+
+# ------------------------------------------------------------
+# Service interface
+#
+#   /aruco/land     spar_node/FrameTarget
+#   /aruco/roi      spar_node/FrameTarget
+#
+# Both take the frame name to fly to.
+# ------------------------------------------------------------
+
+def handle_land(req):
+
+    rospy.loginfo(
+        "Service request: land at frame '%s'.",
+        req.frame
+    )
+
+    return queue_request(
+        "land",
+        req.frame
+    )
+
+
+def handle_roi(req):
+
+    rospy.loginfo(
+        "Service request: ROI at frame '%s'.",
+        req.frame
+    )
+
+    return queue_request(
+        "roi",
+        req.frame
+    )
+
+
+# ============================================================
+# Landing point callback
+#
+# /request_landing_point
+# geometry_msgs/Point
+#
+# Manual override - fly to an arbitrary map coordinate and land
+# there, rather than at a detected frame. Like everything else,
+# it only queues work for the main thread.
+# ============================================================
+
+def landing_point_callback(msg):
+
+    global pending_request
+
+    with state_lock:
+
+        if not scan_complete:
+
+            rospy.logwarn(
+                "Landing point received before the scan "
+                "finished - ignoring."
+            )
+
+            return
+
+        if pending_request is not None:
+
+            rospy.logwarn(
+                "Landing point received while another request "
+                "is in progress - ignoring."
+            )
+
+            return
+
+        pending_request = (
+            "land_point",
+            [msg.x, msg.y, msg.z]
+        )
+
+    rospy.loginfo(
+        "Landing point queued: [%.2f, %.2f, %.2f]",
+        msg.x,
+        msg.y,
+        msg.z
+    )
+
+
+# ============================================================
+# Navigate to a point (with Breadcrumb + fallback)
+# ============================================================
+
+def navigate_to_point(
+        spar_client,
+        srvc_bc,
+        path_pub,
+        target,
+        yaw=0.0):
+
+    global current_mission_position
+
+    with state_lock:
+
+        if current_mission_position is None:
+
+            rospy.logerr(
+                "No mission position is available."
+            )
+
+            return False
+
+        start = [
+            current_mission_position[0],
+            current_mission_position[1],
+            current_mission_position[2]
+        ]
+
+    rospy.loginfo(
+        "Using last reached mission position: "
+        "[%.2f, %.2f, %.2f]",
+        start[0],
+        start[1],
+        start[2]
+    )
+
+    breadcrumb_path = get_breadcrumb_path(
+        srvc_bc,
+        start,
+        target
+    )
+
+    actual_target = [
+        target[0],
+        target[1],
+        target[2],
+        yaw
+    ]
+
+    # --------------------------------------------------------
+    # If the target is blocked, find a nearby point
+    # --------------------------------------------------------
+
+    if len(breadcrumb_path) == 0:
+
+        rospy.logwarn(
+            "Requested target is unavailable."
+        )
+
+        actual_target, breadcrumb_path = (
+            find_nearby_valid_waypoint(
+                srvc_bc,
+                start,
+                actual_target
+            )
+        )
+
+        if actual_target is None or len(breadcrumb_path) == 0:
+
+            rospy.logerr(
+                "No valid approach point could be found."
+            )
+
+            return False
+
+        rospy.logwarn(
+            "Using fallback target: [%.2f, %.2f, %.2f]",
+            actual_target[0],
+            actual_target[1],
+            actual_target[2]
+        )
+
+    publish_path(
+        path_pub,
+        breadcrumb_path
+    )
+
+    rospy.loginfo(
+        "Following Breadcrumb path to target..."
+    )
+
+    success = follow_breadcrumb_path(
+        spar_client,
+        breadcrumb_path,
+        actual_target[3]
+    )
+
+    if not success:
+        return False
+
+    rospy.loginfo(
+        "Converging to target..."
+    )
+
+    success = send_wp(
+        spar_client,
+        actual_target[0],
+        actual_target[1],
+        actual_target[2],
+        actual_target[3],
+        wait_time=2.0
+    )
+
+    if not success:
+
+        rospy.logerr(
+            "Failed to reach target."
+        )
+
+        return False
+
+    with state_lock:
+        current_mission_position = actual_target
+
+    rospy.loginfo(
+        "Target reached."
+    )
+
+    return True
+
+
+# ============================================================
+# Execute a queued request
+# ============================================================
+
+def execute_request(
+        request,
+        spar_client,
+        srvc_bc,
+        path_pub):
+
+    global current_mission_position
+
+    action = request[0]
+
+    rospy.loginfo(
+        "================================================"
+    )
+
+    # --------------------------------------------------------
+    # Manual landing point (topic override)
+    # --------------------------------------------------------
+
+    if action == "land_point":
+
+        target = request[1]
+
+        rospy.loginfo(
+            "EXECUTING: land at manual point "
+            "[%.2f, %.2f, %.2f]",
+            target[0],
+            target[1],
+            target[2]
+        )
+
+        rospy.loginfo(
+            "================================================"
+        )
+
+        if navigate_to_point(
+                spar_client,
+                srvc_bc,
+                path_pub,
+                target):
+
+            land(spar_client)
+
+        return
+
+    # --------------------------------------------------------
+    # Frame-based request - re-resolve the estimate now, so we
+    # use every observation collected up to this moment.
+    # --------------------------------------------------------
+
+    frame_name = request[1]
+
+    position = resolve_frame(frame_name)
+
+    if position is None:
+
+        rospy.logerr(
+            "Frame '%s' is no longer resolvable.",
+            frame_name
+        )
+
+        return
+
+    rospy.loginfo(
+        "EXECUTING: %s at frame '%s'",
+        action,
+        frame_name
+    )
+
+    rospy.loginfo(
+        "Frame estimate (map): [%.2f, %.2f, %.2f]",
+        position[0],
+        position[1],
+        position[2]
+    )
+
+    rospy.loginfo(
+        "================================================"
+    )
+
+    # Transit at a safe altitude rather than at the target's own
+    # (ground-level, and noisiest) z estimate.
+    success = navigate_to_point(
+        spar_client,
+        srvc_bc,
+        path_pub,
+        [
+            position[0],
+            position[1],
+            APPROACH_HEIGHT
+        ]
+    )
+
+    if not success:
+
+        rospy.logerr(
+            "Could not reach frame '%s'.",
+            frame_name
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # roi: descend over the frame and hold
+    # --------------------------------------------------------
+
+    if action == "roi":
+
+        rospy.loginfo(
+            "Descending to ROI height %.2f m over '%s'...",
+            ROI_HEIGHT,
+            frame_name
+        )
+
+        success = send_wp(
+            spar_client,
+            position[0],
+            position[1],
+            ROI_HEIGHT,
+            0.0,
+            wait_time=2.0
+        )
+
+        if not success:
+
+            rospy.logerr(
+                "Failed to descend to ROI height over '%s'.",
+                frame_name
+            )
+
+            return
+
+        with state_lock:
+
+            current_mission_position = [
+                position[0],
+                position[1],
+                ROI_HEIGHT,
+                0.0
+            ]
+
+        rospy.loginfo(
+            "Holding over ROI '%s' at %.2f m.",
+            frame_name,
+            ROI_HEIGHT
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # land: descend onto the frame
+    #
+    # navigate_to_point() has already put the UAV over the
+    # target at APPROACH_HEIGHT, so this is a straight
+    # MOTION_LAND from directly above it.
+    # --------------------------------------------------------
+
+    if action == "land":
+
+        rospy.loginfo(
+            "Descending onto '%s'...",
+            frame_name
+        )
+
+        land(spar_client)
+
+        return
+
+    rospy.logerr(
+        "Unknown action '%s' - ignoring.",
+        action
+    )
+
+
+# ============================================================
+# Execute scan
+#
+# Lawnmower pattern, with mid-scan diversions.
+#
+# Diversions are taken between Breadcrumb points rather than by
+# pre-empting an in-flight goal: the UAV finishes the leg it is
+# on, flies to the target, fires the actuator, then the current
+# scan segment is RE-PLANNED from wherever the diversion left
+# the UAV. That keeps a single action client, a single thread,
+# and no cancelled goals.
+# ============================================================
+
+def send_wps(
+        spar_client,
+        srvc_bc,
+        path_pub,
+        actuator_pub):
+
+    global current_mission_position
+    global scan_complete
+
+    success = True
+
+    height = 2.0
+
+    # ========================================================
+    # Scan waypoints
+    # ========================================================
+
+    wps = [
+
+        [-1.0, -1.0, height, 0.0],
+
+        [-2.5, -2.5, height, 0.0],
+
+        [-1.5,  2.5, height, 0.0],
+        [-1.5,  0.0, height, 0.0],
+        [-1.5, -2.5, height, 0.0],
+
+        [-0.5, -2.5, height, 0.0],
+
+        [-0.5,  0.0, height, 0.0],
+        [-0.5,  2.5, height, 0.0],
+
+        [0.5,  2.5, height, 0.0],
+
+        [0.5,  0.0, height, 0.0],
+        [0.5, -2.5, height, 0.0],
+
+        [1.5, -2.5, height, 0.0],
+
+        [1.5,  0.0, height, 0.0],
+        [1.5,  2.5, height, 0.0],
+
+        [2.5,  2.5, height, 0.0],
+
+        [2.5,  0.0, height, 0.0],
+        [2.5, -2.5, height, 0.0],
+    ]
+
+    # ========================================================
+    # Initial position
+    # ========================================================
+
+    with state_lock:
+        current_mission_position = wps[0]
+
+    # ========================================================
+    # Execute scan segments
+    # ========================================================
+
+    for segment in range(len(wps) - 1):
+
+        requested_end = wps[segment + 1]
+
+        segment_done = False
+
+        # ----------------------------------------------------
+        # Re-planning loop for this segment. Runs more than
+        # once only if a diversion interrupted it.
+        # ----------------------------------------------------
+
+        while not segment_done and not rospy.is_shutdown():
+
+            with state_lock:
+
+                actual_start = [
+                    current_mission_position[0],
+                    current_mission_position[1],
+                    current_mission_position[2]
+                ]
+
+            rospy.loginfo(
+                "================================================"
+            )
+
+            rospy.loginfo(
+                "Planning scan segment %d/%d",
+                segment + 1,
+                len(wps) - 1
+            )
+
+            rospy.loginfo(
+                "Requested start: "
+                "[%.2f, %.2f, %.2f]",
+
+                actual_start[0],
+                actual_start[1],
+                actual_start[2]
+            )
+
+            rospy.loginfo(
+                "Requested end: "
+                "[%.2f, %.2f, %.2f]",
+
+                requested_end[0],
+                requested_end[1],
+                requested_end[2]
+            )
+
+            # ------------------------------------------------
+            # Try requested waypoint
+            # ------------------------------------------------
+
+            path = get_breadcrumb_path(
+                srvc_bc,
+                actual_start,
+
+                [
+                    requested_end[0],
+                    requested_end[1],
+                    requested_end[2]
+                ]
+            )
+
+            actual_end = requested_end
+
+            # ------------------------------------------------
+            # Fallback if blocked
+            # ------------------------------------------------
+
+            if len(path) == 0:
+
+                rospy.logwarn(
+                    "Requested waypoint is unavailable."
+                )
+
+                actual_end, path = find_nearby_valid_waypoint(
+                    srvc_bc,
+                    actual_start,
+                    requested_end
+                )
+
+                if len(path) == 0 or actual_end is None:
+
+                    rospy.logerr(
+                        "No valid fallback point found "
+                        "for waypoint %d.",
+                        segment + 2
+                    )
+
+                    success = False
+                    break
+
+                rospy.logwarn(
+                    "Original waypoint: "
+                    "[%.2f, %.2f, %.2f]",
+
+                    requested_end[0],
+                    requested_end[1],
+                    requested_end[2]
+                )
+
+                rospy.logwarn(
+                    "Fallback waypoint: "
+                    "[%.2f, %.2f, %.2f]",
+
+                    actual_end[0],
+                    actual_end[1],
+                    actual_end[2]
+                )
+
+            publish_path(
+                path_pub,
+                path
+            )
+
+            # ------------------------------------------------
+            # Follow Breadcrumb path, checking for diversions
+            # between points
+            # ------------------------------------------------
+
+            rospy.loginfo(
+                "Following Breadcrumb path "
+                "with %d points.",
+                len(path)
+            )
+
+            diverted = False
+
+            for path_index, point in enumerate(path):
+
+                x = point.position.x
+                y = point.position.y
+                z = point.position.z
+
+                rospy.loginfo(
+                    "Segment %d: "
+                    "point %d/%d -> "
+                    "[%.2f, %.2f, %.2f]",
+
+                    segment + 1,
+                    path_index + 1,
+                    len(path),
+
+                    x,
+                    y,
+                    z
+                )
+
+                success, interrupted = send_wp_scan(
+                    spar_client,
+                    x,
+                    y,
+                    z,
+                    actual_end[3]
+                )
+
+                if not success:
+
+                    rospy.logerr(
+                        "Breadcrumb path execution failed."
+                    )
+
+                    break
+
+                if interrupted:
+
+                    # Cancelled mid-leg: the UAV is somewhere along
+                    # the way to (x, y, z), not at it. Record the
+                    # commanded point anyway - it is the closest
+                    # estimate available without a pose subscriber,
+                    # and Breadcrumb only uses it as a planning
+                    # start, with SPAR flying from wherever the UAV
+                    # actually is.
+                    with state_lock:
+
+                        current_mission_position = [
+                            x,
+                            y,
+                            z,
+                            actual_end[3]
+                        ]
+
+                else:
+
+                    # Track position per point so a diversion can be
+                    # planned from where the UAV actually is.
+                    with state_lock:
+
+                        current_mission_position = [
+                            x,
+                            y,
+                            z,
+                            actual_end[3]
+                        ]
+
+                label = take_pending_diversion()
+
+                if label is not None:
+
+                    # The UAV stopped where it is and the drop
+                    # happens there, so there is no detour to
+                    # recover from. The segment is simply re-planned
+                    # from here to its endpoint, which loses no scan
+                    # coverage because the UAV has not skipped ahead.
+                    handle_diversion(actuator_pub, label)
+
+                    diverted = True
+                    break
+
+            if not success:
+                break
+
+            if not diverted:
+                segment_done = True
+
+        if not success:
+            break
+
+        # ----------------------------------------------------
+        # Pause at endpoint
+        # ----------------------------------------------------
+
+        rospy.sleep(2.0)
+
+        with state_lock:
+
+            current_mission_position = actual_end
+
+        rospy.loginfo(
+            "Updated mission position: "
+            "[%.2f, %.2f, %.2f]",
+            actual_end[0],
+            actual_end[1],
+            actual_end[2]
+        )
+
+    # ========================================================
+    # Drain anything detected on the final leg
+    # ========================================================
+
+    if success:
+
+        while not rospy.is_shutdown():
+
+            label = take_pending_diversion()
+
+            if label is None:
+                break
+
+            rospy.loginfo(
+                "Handling target queued during the final leg."
+            )
+
+            handle_diversion(actuator_pub, label)
+
+    # ========================================================
+    # Scan complete
+    # ========================================================
+
+    if success:
+
+        with state_lock:
+            scan_complete = True
+
+            final_position = list(current_mission_position)
+
+        rospy.loginfo(
+            "================================================"
+        )
+
+        rospy.loginfo(
+            "SCAN COMPLETE"
+        )
+
+        rospy.loginfo(
+            "Final mission position: "
+            "[%.2f, %.2f, %.2f]",
+
+            final_position[0],
+            final_position[1],
+            final_position[2]
+        )
+
+        rospy.loginfo(
+            "UAV is hovering at the final scan waypoint."
+        )
+
+        log_frame_summary()
+
+        rospy.loginfo(
+            "Waiting for a request."
+        )
+
+        rospy.loginfo(
+            "  Services (spar_node/FrameTarget, argument is a frame name):"
+        )
+
+        rospy.loginfo(
+            "    %s",
+            rospy.get_param("~land_service", "/aruco/land")
+        )
+
+        rospy.loginfo(
+            "    %s",
+            rospy.get_param("~roi_service", "/aruco/roi")
+        )
+
+        rospy.loginfo(
+            "  Topic (geometry_msgs/Point, manual land override):"
+        )
+
+        rospy.loginfo(
+            "    %s",
+            rospy.get_param("~landing_topic", "/request_landing_point")
+        )
+
+        rospy.loginfo(
+            "================================================"
+        )
+
+    else:
+
+        rospy.logerr(
+            "Scan mission failed."
+        )
+
+    return success
+
+
+# ============================================================
+# Main
+# ============================================================
+
+def main(args):
+
+    global pending_request
+    global tf_buffer
+
+    global MAP_FRAME
+    global CAMERA_FRAME
+    global MARKER_OUTLIER_DISTANCE
+    global MARKER_MIN_OBSERVATIONS
+    global APPROACH_HEIGHT
+    global ROI_HEIGHT
+    global ACTUATOR_HOLD
+    global PREFER_TF
+
+    # anonymous=False on purpose: an anonymous node name would
+    # mangle both the private parameters (~speed, ~accuracy...)
+    # and the advertised service names.
+    rospy.init_node("scan")
+
+    # --------------------------------------------------------
+    # Parameters
+    # --------------------------------------------------------
+
+    action_ns = rospy.get_param(
+        "~action_topic",
+        "spar/flight"
+    )
+
+    landing_topic = rospy.get_param(
+        "~landing_topic",
+        "/request_landing_point"
+    )
+
+    aruco_topic = rospy.get_param(
+        "~aruco_topic",
+        "/target_detections/aruco"
+    )
+
+    yolo_topic = rospy.get_param(
+        "~yolo_topic",
+        "/target_detections/yolo"
+    )
+
+    actuator_topic = rospy.get_param(
+        "~actuator_topic",
+        "/actuator_control/actuator_a"
+    )
+
+    land_service_name = rospy.get_param(
+        "~land_service",
+        "/aruco/land"
+    )
+
+    roi_service_name = rospy.get_param(
+        "~roi_service",
+        "/aruco/roi"
+    )
+
+    MAP_FRAME = rospy.get_param(
+        "~map_frame",
+        "map"
+    )
+
+    CAMERA_FRAME = rospy.get_param(
+        "~camera_frame",
+        ""
+    )
+
+    MARKER_OUTLIER_DISTANCE = rospy.get_param(
+        "~marker_outlier_distance",
+        1.0
+    )
+
+    MARKER_MIN_OBSERVATIONS = rospy.get_param(
+        "~marker_min_observations",
+        3
+    )
+
+    APPROACH_HEIGHT = rospy.get_param(
+        "~approach_height",
+        2.0
+    )
+
+    ROI_HEIGHT = rospy.get_param(
+        "~roi_height",
+        1.5
+    )
+
+    ACTUATOR_HOLD = rospy.get_param(
+        "~actuator_hold",
+        2.0
+    )
+
+    PREFER_TF = rospy.get_param(
+        "~prefer_tf",
+        True
+    )
+
+    # --------------------------------------------------------
+    # TF
+    # --------------------------------------------------------
+
+    tf_buffer = tf2_ros.Buffer(rospy.Duration(30.0))
+
+    tf_listener = tf2_ros.TransformListener(tf_buffer)  # noqa: F841
+
+    # --------------------------------------------------------
+    # Publishers
+    # --------------------------------------------------------
+
+    path_pub = rospy.Publisher(
+        "/path",
+        Path,
+        queue_size=1,
+        latch=True
+    )
+
+    # latch=True so the actuator node still gets the command if it
+    # subscribes slightly late.
+    actuator_pub = rospy.Publisher(
+        actuator_topic,
+        Bool,
+        queue_size=1,
+        latch=True
+    )
+
+    # --------------------------------------------------------
+    # Connect to SPAR
+    # --------------------------------------------------------
+
+    spar_client = actionlib.SimpleActionClient(
+        action_ns,
+        FlightMotionAction
+    )
+
+    rospy.loginfo(
+        "Waiting for SPAR..."
+    )
+
+    spar_client.wait_for_server()
+
+    rospy.loginfo(
+        "Connected to SPAR."
+    )
+
+    # --------------------------------------------------------
+    # Connect to Breadcrumb
+    # --------------------------------------------------------
+
+    rospy.loginfo(
+        "Waiting for Breadcrumb..."
+    )
+
+    rospy.wait_for_service(
+        "/breadcrumb/request_path"
+    )
+
+    srvc_bc = rospy.ServiceProxy(
+        "/breadcrumb/request_path",
+        RequestPath
+    )
+
+    rospy.loginfo(
+        "Connected to Breadcrumb."
+    )
+
+    # --------------------------------------------------------
+    # Detections
+    #
+    # Two separate callbacks:
+    #   ArUco -> detection_callback, which transforms into the map
+    #            frame and averages, because landing needs a
+    #            position the UAV can navigate to later.
+    #   YOLO  -> yolo_callback, which only reads the label. The drop
+    #            happens where the UAV is standing, so no TF is
+    #            involved at all.
+    # --------------------------------------------------------
+
+    rospy.Subscriber(
+        aruco_topic,
+        TargetDetectionArray,
+        detection_callback,
+        queue_size=10
+    )
+
+    rospy.Subscriber(
+        yolo_topic,
+        TargetDetectionArray,
+        yolo_callback,
+        queue_size=10
+    )
+
+    rospy.loginfo(
+        "ArUco detections (map-frame, for landing): %s",
+        aruco_topic
+    )
+
+    rospy.loginfo(
+        "YOLO detections (label only, drop in place): %s",
+        yolo_topic
+    )
+
+    rospy.loginfo(
+        "Actuator labels: %s",
+        ", ".join(
+            "%s -> %s" % (key, value)
+            for key, value in sorted(DIVERSION_ACTUATOR.items())
+        )
+    )
+
+    rospy.loginfo(
+        "Actuator topic: %s",
+        actuator_topic
+    )
+
+    # --------------------------------------------------------
+    # Request interfaces
+    # --------------------------------------------------------
+
+    rospy.Service(
+        land_service_name,
+        FrameTarget,
+        handle_land
+    )
+
+    rospy.Service(
+        roi_service_name,
+        FrameTarget,
+        handle_roi
+    )
+
+    rospy.Subscriber(
+        landing_topic,
+        Point,
+        landing_point_callback,
+        queue_size=1
+    )
+
+    rospy.loginfo(
+        "Request interfaces ready."
+    )
+
+    # --------------------------------------------------------
+    # Execute scan
+    # --------------------------------------------------------
+
+    if rospy.is_shutdown():
+        return
+
+    success = send_wps(
+        spar_client,
+        srvc_bc,
+        path_pub,
+        actuator_pub
+    )
+
+    if not success:
+
+        rospy.logerr(
+            "Scan failed. Shutting down."
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # Serve requests
+    #
+    # All flying happens here, on one thread, so the action
+    # client is never driven from two places at once.
+    # --------------------------------------------------------
+
+    rate = rospy.Rate(10.0)
+
+    while not rospy.is_shutdown():
+
+        with state_lock:
+            request = pending_request
+
+        if request is not None:
+
+            execute_request(
+                request,
+                spar_client,
+                srvc_bc,
+                path_pub
+            )
+
+            with state_lock:
+                pending_request = None
+
+        rate.sleep()
+
+
+# ============================================================
+# Entry point
+# ============================================================
+
+if __name__ == "__main__":
+
+    try:
+
+        main(sys.argv)
+
+    except rospy.ROSInterruptException:
+
+        pass
+
+    print("")

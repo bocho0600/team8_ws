@@ -1,0 +1,10 @@
+<launch>
+    <node pkg="image_processing" type="dai_publisher_yolov11_runner.py" name="dai_publisher_yolov11_runner" output="screen" />
+    <node pkg="image_processing" type="aruco_subscriber.py" name="aruco_subscriber" output="screen" />
+    <node pkg="image_processing" type="tf2_broadcaster_frames.py" name="tf2_broadcaster_frames" output="screen" />
+    <node pkg="image_processing" type="target_tf2_broadcaster.py" name="target_tf2_broadcaster" output="screen" />
+    <node pkg="image_processing" type="target_tf2_listener.py" name="target_tf2_listener" output="screen" />
+    <node name="servo_node" pkg="actuator_control" type="servo.py" output="screen">
+        <param name="use_sim_time" value="false" />
+    </node>
+</launch>

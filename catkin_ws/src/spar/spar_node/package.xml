@@ -1,0 +1,40 @@
+<package format="2">
+<name>spar_node</name>
+<version>0.0.0</version>
+<description>The spar_node package</description>
+<maintainer email="pryre@todo.todo">pryre</maintainer>
+<license>TODO</license>
+<buildtool_depend>catkin</buildtool_depend>
+<!--  Required to generate srv/FrameTarget.srv at build time  -->
+<build_depend>message_generation</build_depend>
+<build_depend>actionlib</build_depend>
+<build_depend>actionlib_msgs</build_depend>
+<build_depend>mavros_msgs</build_depend>
+<build_depend>roscpp</build_depend>
+<build_depend>rospy</build_depend>
+<build_depend>spar_msgs</build_depend>
+<build_depend>geometry_msgs</build_depend>
+<build_depend>std_msgs</build_depend>
+<build_export_depend>actionlib</build_export_depend>
+<build_export_depend>actionlib_msgs</build_export_depend>
+<build_export_depend>mavros_msgs</build_export_depend>
+<build_export_depend>roscpp</build_export_depend>
+<build_export_depend>rospy</build_export_depend>
+<build_export_depend>spar_msgs</build_export_depend>
+<build_export_depend>geometry_msgs</build_export_depend>
+<build_export_depend>std_msgs</build_export_depend>
+<exec_depend>actionlib</exec_depend>
+<exec_depend>actionlib_msgs</exec_depend>
+<exec_depend>mavros_msgs</exec_depend>
+<exec_depend>roscpp</exec_depend>
+<exec_depend>rospy</exec_depend>
+<exec_depend>spar_msgs</exec_depend>
+<exec_depend>geometry_msgs</exec_depend>
+<exec_depend>std_msgs</exec_depend>
+<!--  Required at runtime to use the generated FrameTarget service  -->
+<exec_depend>message_runtime</exec_depend>
+<!--  nav_prod_aruco consumes TargetDetectionArray from image_processing  -->
+<exec_depend>image_processing</exec_depend>
+<!--  The export tag contains other, unspecified, tags  -->
+<export> </export>
+</package>

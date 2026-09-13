@@ -1,0 +1,42 @@
+map:
+  width: 80
+  height: 80
+  resolution: 0.1
+  boarder: true
+
+obstacles:
+  # grid = (map * 10) + 40
+
+  # --- ON the path: forces visible Breadcrumb avoidance ---
+
+  obs_0:                    # map (-1.0, 2.5) - blocks the -1.5 -> -0.5
+   type: "square"           # transition along the top edge
+   size: 3
+   position:
+     x: 30
+     y: 65
+
+  obs_1:                    # map (1.0, -2.5) - blocks the 0.5 -> 1.5
+   type: "circle"           # transition along the bottom edge
+   size: 3
+   position:
+     x: 50
+     y: 15
+
+  # --- Mid-lane, offset so it deflects rather than blocks ---
+
+  obs_2:                    # map (-1.35, 0.0) - clips the -1.5 lane
+   type: "circle"
+   size: 2
+   position:
+     x: 26
+     y: 40
+
+  # --- Off-path, for scenery ---
+
+  obs_3:                    # map (2.0, 1.0)
+   type: "square"
+   size: 3
+   position:
+     x: 60
+     y: 50

@@ -1,0 +1,27 @@
+# catkin build artefacts (generated inside the container)
+catkin_ws/build/
+catkin_ws/devel/
+catkin_ws/install/
+catkin_ws/logs/
+catkin_ws/.catkin_tools/
+
+# ROS runtime state
+.ros/
+*.bag
+
+# container-local state
+docker/.cache/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# machine-specific distributed-ROS settings (copy from .env.example)
+.env

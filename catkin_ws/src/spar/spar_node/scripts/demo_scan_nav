@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+
+import sys
+from math import *
+
+import rospy
+import actionlib
+from actionlib_msgs.msg import GoalStatus
+
+from spar_msgs.msg import FlightMotionAction, FlightMotionGoal
+from breadcrumb.srv import RequestPath
+
+
+def send_wp(spar_client, x, y, z, yaw):
+    speed = rospy.get_param("~speed", 1.0)
+    accuracy = rospy.get_param("~accuracy", 0.1)
+
+    goal = FlightMotionGoal()
+    goal.motion = FlightMotionGoal.MOTION_GOTO
+
+    goal.position.x = x
+    goal.position.y = y
+    goal.position.z = z
+    goal.yaw = yaw
+
+    goal.velocity_vertical = speed
+    goal.velocity_horizontal = speed
+    goal.yawrate = speed
+
+    goal.wait_for_convergence = True
+    goal.position_radius = accuracy
+    goal.yaw_range = accuracy
+
+    spar_client.send_goal(goal)
+
+    # Cancel current goal if ROS is shutting down
+    rospy.on_shutdown(lambda: spar_client.cancel_goal())
+
+    # Wait for waypoint to be reached
+    spar_client.wait_for_result()
+
+    # Stop at waypoint for a moment
+    rospy.sleep(2)
+
+    return spar_client.get_state() == GoalStatus.SUCCEEDED
+
+
+def get_breadcrumb_path(srvc_bc, start, end):
+    """
+    Request a path from Breadcrumb between two XYZ points.
+
+    start = [x, y, z]
+    end   = [x, y, z]
+
+    Returns:
+        List of [x, y, z] points
+    """
+
+    req = RequestPath._request_class()
+
+    req.start.x = start[0]
+    req.start.y = start[1]
+    req.start.z = start[2]
+
+    req.end.x = end[0]
+    req.end.y = end[1]
+    req.end.z = end[2]
+
+    rospy.loginfo(
+        "Requesting Breadcrumb path: "
+        "[%.2f, %.2f, %.2f] -> [%.2f, %.2f, %.2f]",
+        req.start.x,
+        req.start.y,
+        req.start.z,
+        req.end.x,
+        req.end.y,
+        req.end.z
+    )
+
+    res = srvc_bc(req)
+
+    # Breadcrumb could not find a path
+    if len(res.path.poses) == 0:
+        rospy.logerr(
+            "Breadcrumb could not find a path from "
+            "[%.2f, %.2f, %.2f] to [%.2f, %.2f, %.2f]",
+            start[0], start[1], start[2],
+            end[0], end[1], end[2]
+        )
+        return []
+
+    path = []
+
+    for pose in res.path.poses:
+        path.append([
+            pose.position.x,
+            pose.position.y,
+            pose.position.z
+        ])
+
+    rospy.loginfo(
+        "Breadcrumb returned %i path points",
+        len(path)
+    )
+
+    return path
+
+
+def send_wps(spar_client):
+    success = True
+
+    height = 2.0
+
+    # ---------------------------------------------------------
+    # Scan waypoints
+    #
+    # [X, Y, Z, Yaw]
+    #
+    # Keep the initial waypoints exactly as requested.
+    # ---------------------------------------------------------
+
+    wps = [
+        # Initial / safe waypoint
+        [-1.0, -1.0, height, 0.0],
+
+        # Move to first scan line
+        [-2.5, -2.5, height, 0.0],
+
+        # Y sweep: -2.5 -> 0 -> +2.5
+        [-1.5,  2.5, height, 0.0],
+        [-1.5,  0.0, height, 0.0],
+        [-1.5, -2.5, height, 0.0],
+
+        # Move to next scan line
+        [-0.5, -2.5, height, 0.0],
+
+        # Y sweep: -2.5 -> 0 -> +2.5
+        [-0.5,  0.0, height, 0.0],
+        [-0.5,  2.5, height, 0.0],
+
+        # Move to next scan line
+        [ 0.5,  2.5, height, 0.0],
+
+        # Y sweep: +2.5 -> 0 -> -2.5
+        [ 0.5,  0.0, height, 0.0],
+        [ 0.5, -2.5, height, 0.0],
+
+        # Move to next scan line
+        [ 1.5, -2.5, height, 0.0],
+
+        # Y sweep: -2.5 -> 0 -> +2.5
+        [ 1.5,  0.0, height, 0.0],
+        [ 1.5,  2.5, height, 0.0],
+
+        # Move to final scan line
+        [ 2.5,  2.5, height, 0.0],
+
+        # Y sweep: +2.5 -> 0 -> -2.5
+        [ 2.5,  0.0, height, 0.0],
+        [ 2.5, -2.5, height, 0.0],
+    ]
+
+    # ---------------------------------------------------------
+    # Connect to Breadcrumb
+    # ---------------------------------------------------------
+
+    rospy.loginfo("Waiting for Breadcrumb service...")
+
+    rospy.wait_for_service('/breadcrumb/request_path')
+
+    srvc_bc = rospy.ServiceProxy(
+        '/breadcrumb/request_path',
+        RequestPath
+    )
+
+    rospy.loginfo("Connected to Breadcrumb.")
+
+    # ---------------------------------------------------------
+    # Plan and execute each segment
+    # ---------------------------------------------------------
+
+    for segment in range(len(wps) - 1):
+
+        start_wp = wps[segment]
+        end_wp = wps[segment + 1]
+
+        rospy.loginfo(
+            "Planning segment %i/%i",
+            segment + 1,
+            len(wps) - 1
+        )
+
+        # Request Breadcrumb path
+        path = get_breadcrumb_path(
+            srvc_bc,
+            [start_wp[0], start_wp[1], start_wp[2]],
+            [end_wp[0], end_wp[1], end_wp[2]]
+        )
+
+        if len(path) == 0:
+            rospy.logerr(
+                "Waypoint segment %i failed. Stopping mission.",
+                segment + 1
+            )
+            success = False
+            break
+
+        # -----------------------------------------------------
+        # Follow Breadcrumb path
+        # -----------------------------------------------------
+
+        rospy.loginfo(
+            "Following Breadcrumb path with %i points",
+            len(path)
+        )
+
+        for path_index, point in enumerate(path):
+
+            # Use the waypoint yaw for all points in this segment
+            yaw = end_wp[3]
+
+            rospy.loginfo(
+                "Segment %i: path point %i/%i -> "
+                "[%.2f, %.2f, %.2f]",
+                segment + 1,
+                path_index + 1,
+                len(path),
+                point[0],
+                point[1],
+                point[2]
+            )
+
+            success = send_wp(
+                spar_client,
+                point[0],
+                point[1],
+                point[2],
+                yaw
+            )
+
+            if not success:
+                rospy.logerr(
+                    "Breadcrumb path execution failed."
+                )
+                break
+
+        if not success:
+            break
+
+    if success:
+        rospy.loginfo("Breadcrumb mission complete!")
+    else:
+        rospy.logerr("Breadcrumb mission failed!")
+
+
+def main(args):
+
+    # ---------------------------------------------------------
+    # Initialise ROS
+    # ---------------------------------------------------------
+
+    rospy.init_node(
+        'takeoff',
+        anonymous=True
+    )
+
+    # ---------------------------------------------------------
+    # Get action namespace
+    # ---------------------------------------------------------
+
+    action_ns = rospy.get_param(
+        "~action_topic",
+        'spar/flight'
+    )
+
+    # ---------------------------------------------------------
+    # Create action client
+    # ---------------------------------------------------------
+
+    spar_client = actionlib.SimpleActionClient(
+        action_ns,
+        FlightMotionAction
+    )
+
+    rospy.loginfo("Waiting for spar...")
+
+    spar_client.wait_for_server()
+
+    rospy.loginfo("Connected to spar.")
+
+    # ---------------------------------------------------------
+    # Execute mission
+    # ---------------------------------------------------------
+
+    if not rospy.is_shutdown():
+        send_wps(spar_client)
+
+
+if __name__ == '__main__':
+
+    try:
+        main(sys.argv)
+
+    except rospy.ROSInterruptException:
+        pass
+
+    print('')
