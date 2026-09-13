@@ -76,6 +76,19 @@ expect "rqt plugins resolve" "ok" gcs \
     'for p in rqt_gui rqt_gui_py rqt_generic_hud rqt_mavros_gui rqt_eyedropper rqt_quaternion_view; do rospack find $p >/dev/null 2>&1 || exit 1; done; echo ok'
 expect "matplotlib present (rqt_quaternion_view)" "ok" gcs \
     'python3 -c "import matplotlib" && echo ok'
+# `rospack find` passing says nothing about whether the plugin actually starts.
+# Two things used to break only at launch time: a `#!/usr/bin/env python`
+# shebang (Noetic ships python3 only, so rosrun died with "python: No such file
+# or directory"), and rqt_py_common missing from the image.
+expect "rqt scripts have a resolvable interpreter" "ok" gcs \
+    'for p in rqt_generic_hud rqt_mavros_gui rqt_eyedropper rqt_quaternion_view; do
+         command -v "$(head -1 "$(rospack find $p)/scripts/$p" | sed "s|^#!/usr/bin/env ||")" >/dev/null || exit 1
+     done; echo ok'
+expect "rqt plugin modules import" "ok" gcs \
+    'for m in rqt_generic_hud.generic_hud_options rqt_mavros_gui.mavros_gui_options \
+              rqt_quaternion_view.quaternion_view_options rqt_eyedropper.eyedrop; do
+         python3 -c "import $m" 2>/dev/null || exit 1
+     done; echo ok'
 
 echo "- tmux launchers are usable"
 expect "tmux present" "tmux" uav 'command -v tmux'

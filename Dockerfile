@@ -26,6 +26,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ros-noetic-rviz \
         ros-noetic-rqt-gui \
         ros-noetic-rqt-gui-py \
+        ros-noetic-rqt-py-common \
         ros-noetic-image-transport-plugins \
         python3-matplotlib \
         tmux \

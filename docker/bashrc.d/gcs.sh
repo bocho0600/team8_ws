@@ -39,7 +39,7 @@ function gcs_tmux() {
     _pane_cmd "$p3" 3 "rostopic echo /mavros/vision_pose/pose"
 
     # --- Right column: rviz | rqt_generic_hud | rqt_mavros_gui | kill switch ---
-    _pane_cmd "$p4" 3 "rviz -d $CATKIN_WS/src/spar/spar_node/rviz/emulator_configuration.rviz"
+    _pane_cmd "$p4" 3 "rviz -d $CATKIN_WS/src/image_processing/rviz/gcs_rviz.rviz"
 
     p5=$(tmux split-window -d -v -p 66 -P -F '#{pane_id}' -t "$p4")
     _pane_cmd "$p5" 5 "rosrun rqt_generic_hud rqt_generic_hud"
