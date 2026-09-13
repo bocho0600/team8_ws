@@ -31,6 +31,7 @@
 <exec_depend>spar_msgs</exec_depend>
 <exec_depend>geometry_msgs</exec_depend>
 <exec_depend>std_msgs</exec_depend>
+<exec_depend>std_srvs</exec_depend>
 <!--  Required at runtime to use the generated FrameTarget service  -->
 <exec_depend>message_runtime</exec_depend>
 <!--  nav_prod_aruco consumes TargetDetectionArray from image_processing  -->

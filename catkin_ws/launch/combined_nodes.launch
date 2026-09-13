@@ -6,7 +6,7 @@
              points opposite the airframe's Y instead of alongside it. This
              necessarily flips X (red) too - a rotation can't invert one axis
              on its own. Z (blue) stays pointing down either way. -->
-        <param name="camera_yaw_deg" value="180"/>
+        <param name="camera_yaw_deg" value="-90"/>
     </node>
     <node pkg="image_processing" type="target_tf2_broadcaster.py" name="target_tf2_broadcaster" output="screen" />
     <node pkg="image_processing" type="target_tf2_listener.py" name="target_tf2_listener" output="screen" />

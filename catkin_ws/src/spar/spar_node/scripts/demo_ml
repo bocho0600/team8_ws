@@ -18,7 +18,7 @@ from breadcrumb.srv import RequestPath
 from spar_node.srv import FrameTarget, FrameTargetResponse
 
 from nav_msgs.msg import Path
-from std_msgs.msg import Bool
+from std_srvs.srv import Trigger
 from geometry_msgs.msg import PoseStamped, Point, PointStamped
 
 from image_processing.msg import TargetDetectionArray
@@ -96,7 +96,8 @@ PREFER_TF = True
 # ------------------------------------------------------------
 # Mid-scan diversion targets.
 #
-# YOLO class label -> value published on the actuator topic.
+# YOLO class label -> which actuator service to call.
+# "drop_a" = Payload A (drop_rect), "drop_b" = Payload B (drop_square).
 #
 # These are the raw labels from /target_detections/yolo, NOT frame
 # names: person/backpack detections are handled straight off the
@@ -106,8 +107,8 @@ PREFER_TF = True
 # ------------------------------------------------------------
 
 DIVERSION_ACTUATOR = {
-    "person":   True,
-    "backpack": False,
+    "person":   "drop_b",
+    "backpack": "drop_a",
 }
 
 
@@ -1025,7 +1026,7 @@ def log_frame_summary():
 # handled, and return so the scan can resume.
 # ============================================================
 
-def handle_diversion(actuator_pub, label):
+def handle_diversion(actuator_srvs, label):
     """Fire the actuator for a detected target, in place.
 
     No TF, no navigation: send_wp_scan() has already cancelled the
@@ -1034,23 +1035,35 @@ def handle_diversion(actuator_pub, label):
     handled_targets and every later sighting is ignored.
     """
 
-    value = DIVERSION_ACTUATOR[label]
+    which = DIVERSION_ACTUATOR[label]
+    call = actuator_srvs[which]
 
     rospy.loginfo(
         "================================================"
     )
 
     rospy.loginfo(
-        "TARGET '%s' - firing actuator in place: data=%s",
+        "TARGET '%s' - firing actuator in place: %s",
         label,
-        value
+        which
     )
 
     rospy.loginfo(
         "================================================"
     )
 
-    actuator_pub.publish(Bool(data=value))
+    # Unlike the old topic publish, this blocks until the rack has finished
+    # moving and tells us whether it worked.
+    try:
+        resp = call()
+        if not resp.success:
+            rospy.logerr("Actuator %s reported failure: %s", which, resp.message)
+        else:
+            rospy.loginfo("Actuator %s: %s", which, resp.message)
+    except rospy.ServiceException as e:
+        # A failed drop must not abort the mission - log it and carry on
+        # scanning, exactly as the fire-and-forget publish used to.
+        rospy.logerr("Actuator service %s failed: %s", which, e)
 
     if ACTUATOR_HOLD > 0.0:
         rospy.sleep(ACTUATOR_HOLD)
@@ -1556,7 +1569,7 @@ def send_wps(
         spar_client,
         srvc_bc,
         path_pub,
-        actuator_pub):
+        actuator_srvs):
 
     global current_mission_position
     global scan_complete
@@ -1863,7 +1876,7 @@ def send_wps(
                     # recover from. The segment is simply re-planned
                     # from here to its endpoint, which loses no scan
                     # coverage because the UAV has not skipped ahead.
-                    handle_diversion(actuator_pub, label)
+                    handle_diversion(actuator_srvs, label)
 
                     diverted = True
                     break
@@ -1912,7 +1925,7 @@ def send_wps(
                 "Handling target queued during the final leg."
             )
 
-            handle_diversion(actuator_pub, label)
+            handle_diversion(actuator_srvs, label)
 
     # ========================================================
     # Scan complete
@@ -2035,10 +2048,16 @@ def main(args):
         "/target_detections/yolo"
     )
 
-    actuator_topic = rospy.get_param(
-        "~actuator_topic",
-        "/actuator_control/actuator_a"
-    )
+    actuator_services = {
+        "drop_a": rospy.get_param(
+            "~actuator_drop_a_service",
+            "/actuator_control/drop_a"
+        ),
+        "drop_b": rospy.get_param(
+            "~actuator_drop_b_service",
+            "/actuator_control/drop_b"
+        ),
+    }
 
     land_service_name = rospy.get_param(
         "~land_service",
@@ -2109,14 +2128,22 @@ def main(args):
         latch=True
     )
 
-    # latch=True so the actuator node still gets the command if it
-    # subscribes slightly late.
-    actuator_pub = rospy.Publisher(
-        actuator_topic,
-        Bool,
-        queue_size=1,
-        latch=True
-    )
+    # Persistent=False: the servo node may restart independently of the
+    # mission, and a persistent connection would go stale silently. Waiting
+    # here rather than at drop time means a missing actuator node is caught
+    # on the ground, not mid-scan over a target.
+    actuator_srvs = {}
+    for which, name in sorted(actuator_services.items()):
+        try:
+            rospy.wait_for_service(name, timeout=5.0)
+            rospy.loginfo("Actuator service available: %s (%s)", name, which)
+        except rospy.ROSException:
+            rospy.logwarn(
+                "Actuator service %s (%s) not available - drops will fail. "
+                "Is servo.py running, and pigpiod up on the Pi?",
+                name, which
+            )
+        actuator_srvs[which] = rospy.ServiceProxy(name, Trigger)
 
     # --------------------------------------------------------
     # Connect to SPAR
@@ -2203,8 +2230,11 @@ def main(args):
     )
 
     rospy.loginfo(
-        "Actuator topic: %s",
-        actuator_topic
+        "Actuator services: %s",
+        ", ".join(
+            "%s -> %s" % (key, value)
+            for key, value in sorted(actuator_services.items())
+        )
     )
 
     # --------------------------------------------------------
@@ -2245,7 +2275,7 @@ def main(args):
         spar_client,
         srvc_bc,
         path_pub,
-        actuator_pub
+        actuator_srvs
     )
 
     if not success:

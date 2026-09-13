@@ -18,6 +18,7 @@ from breadcrumb.srv import RequestPath
 from spar_node.srv import FrameTarget, FrameTargetResponse
 
 from nav_msgs.msg import Path
+from std_srvs.srv import Trigger
 from geometry_msgs.msg import PoseStamped, Point, PointStamped
 
 from image_processing.msg import TargetDetectionArray
@@ -72,6 +73,10 @@ APPROACH_HEIGHT = 2.0
 
 # Altitude for the "roi" action - descend to here and hold.
 ROI_HEIGHT = 1.5
+
+# Seconds to hold station after firing the actuator, so the payload
+# has cleared the rack before anything else is commanded.
+ACTUATOR_HOLD = 2.0
 
 
 # ============================================================
@@ -800,6 +805,83 @@ def handle_roi(req):
     )
 
 
+def handle_drop_a(req):
+
+    rospy.loginfo(
+        "Service request: drop Payload A at frame '%s'.",
+        req.frame
+    )
+
+    return queue_request(
+        "drop_a",
+        req.frame
+    )
+
+
+def handle_drop_b(req):
+
+    rospy.loginfo(
+        "Service request: drop Payload B at frame '%s'.",
+        req.frame
+    )
+
+    return queue_request(
+        "drop_b",
+        req.frame
+    )
+
+
+def fire_actuator(actuator_srvs, which):
+    """Call the servo node and report whether the drop actually happened.
+
+    Returns True on success. Never raises: a failed drop should not take
+    the mission down, it should be logged loudly and left to the operator.
+    """
+
+    call = actuator_srvs.get(which)
+
+    if call is None:
+
+        rospy.logerr(
+            "No actuator service configured for '%s'.",
+            which
+        )
+
+        return False
+
+    try:
+
+        resp = call()
+
+        if resp.success:
+
+            rospy.loginfo(
+                "Actuator %s: %s",
+                which,
+                resp.message
+            )
+
+            return True
+
+        rospy.logerr(
+            "Actuator %s reported failure: %s",
+            which,
+            resp.message
+        )
+
+        return False
+
+    except rospy.ServiceException as e:
+
+        rospy.logerr(
+            "Actuator service %s failed: %s",
+            which,
+            e
+        )
+
+        return False
+
+
 # ============================================================
 # Landing point callback
 #
@@ -988,7 +1070,8 @@ def execute_request(
         request,
         spar_client,
         srvc_bc,
-        path_pub):
+        path_pub,
+        actuator_srvs):
 
     global current_mission_position
 
@@ -1086,10 +1169,14 @@ def execute_request(
         return
 
     # --------------------------------------------------------
-    # roi: descend over the frame and hold
+    # roi / drop_a / drop_b: descend over the frame and hold.
+    #
+    # The drops are an ROI plus an actuator call at the bottom -
+    # same approach, same hold height, so they share the descent
+    # rather than duplicating it.
     # --------------------------------------------------------
 
-    if action == "roi":
+    if action in ("roi", "drop_a", "drop_b"):
 
         rospy.loginfo(
             "Descending to ROI height %.2f m over '%s'...",
@@ -1123,6 +1210,21 @@ def execute_request(
                 ROI_HEIGHT,
                 0.0
             ]
+
+        # Only fire once the UAV is settled at ROI height and holding
+        # position - send_wp() above waited for convergence.
+        if action in ("drop_a", "drop_b"):
+
+            rospy.loginfo(
+                "Firing %s over '%s'...",
+                action,
+                frame_name
+            )
+
+            fire_actuator(actuator_srvs, action)
+
+            if ACTUATOR_HOLD > 0.0:
+                rospy.sleep(ACTUATOR_HOLD)
 
         rospy.loginfo(
             "Holding over ROI '%s' at %.2f m.",
@@ -1449,6 +1551,16 @@ def send_wps(
         )
 
         rospy.loginfo(
+            "    %s   (ROI, then fires Payload A)",
+            rospy.get_param("~drop_a_service", "/aruco/drop_a")
+        )
+
+        rospy.loginfo(
+            "    %s   (ROI, then fires Payload B)",
+            rospy.get_param("~drop_b_service", "/aruco/drop_b")
+        )
+
+        rospy.loginfo(
             "  Topic (geometry_msgs/Point, manual land override):"
         )
 
@@ -1519,6 +1631,29 @@ def main(args):
         "~roi_service",
         "/aruco/roi"
     )
+
+    # Frame-target services that also fire a payload at the bottom.
+    drop_a_service_name = rospy.get_param(
+        "~drop_a_service",
+        "/aruco/drop_a"
+    )
+
+    drop_b_service_name = rospy.get_param(
+        "~drop_b_service",
+        "/aruco/drop_b"
+    )
+
+    # ...and the servo node's own services that they call through to.
+    actuator_services = {
+        "drop_a": rospy.get_param(
+            "~actuator_drop_a_service",
+            "/actuator_control/drop_a"
+        ),
+        "drop_b": rospy.get_param(
+            "~actuator_drop_b_service",
+            "/actuator_control/drop_b"
+        ),
+    }
 
     MAP_FRAME = rospy.get_param(
         "~map_frame",
@@ -1641,6 +1776,38 @@ def main(args):
         handle_roi
     )
 
+    rospy.Service(
+        drop_a_service_name,
+        FrameTarget,
+        handle_drop_a
+    )
+
+    rospy.Service(
+        drop_b_service_name,
+        FrameTarget,
+        handle_drop_b
+    )
+
+    # Warn on the ground rather than discovering it over a target.
+    # Not fatal: land/roi still work without an actuator.
+    actuator_srvs = {}
+
+    for which, name in sorted(actuator_services.items()):
+
+        try:
+            rospy.wait_for_service(name, timeout=5.0)
+            rospy.loginfo("Actuator service available: %s (%s)", name, which)
+
+        except rospy.ROSException:
+            rospy.logwarn(
+                "Actuator service %s (%s) not available - %s requests will "
+                "fly the approach but not drop. Is servo.py running, and "
+                "pigpiod up on the Pi?",
+                name, which, which
+            )
+
+        actuator_srvs[which] = rospy.ServiceProxy(name, Trigger)
+
     rospy.Subscriber(
         landing_topic,
         Point,
@@ -1692,7 +1859,8 @@ def main(args):
                 request,
                 spar_client,
                 srvc_bc,
-                path_pub
+                path_pub,
+                actuator_srvs
             )
 
             with state_lock:

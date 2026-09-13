@@ -43,8 +43,10 @@ disros() {
 }
 
 # --- Actuator + ArUco landing helpers ---------------------------------------
-function servo_open1() { rostopic pub /actuator_control/actuator_a std_msgs/Bool '{data: false}'; }
-function servo_open2() { rostopic pub /actuator_control/actuator_a std_msgs/Bool '{data: true}'; }
+# Payload A / Payload B. These block until the rack has finished moving and
+# print success/message, unlike the old fire-and-forget rostopic pub.
+function servo_open1() { rosservice call /actuator_control/drop_a; }
+function servo_open2() { rosservice call /actuator_control/drop_b; }
 
 function _aruco_frame_arg() {
     local arg="$1"

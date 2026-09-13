@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
 import rospy
 import pigpio
+import threading
 import time
-from std_msgs.msg import Bool
+from std_srvs.srv import Trigger, TriggerResponse
 
-sub_a = None
+srv_a = None
+srv_b = None
+
+# Each drop is a blocking there-and-back rack move, so two overlapping calls
+# would fight over the same servo. A service is synchronous, but rospy still
+# serves calls in parallel, so the lock is what actually prevents overlap.
+drop_lock = None
+
 chan_list = [11, 12]  # Set the channels you want to use (see RPi.GPIO docs!)
 
 # === CONFIG ===
@@ -49,20 +57,41 @@ def drop_square():
     time.sleep(2)
     move_rack(-33)
 
-def callback_a(msg_in):
-    # A bool message contains one field called "data" which can be true or false
-    # http://docs.ros.org/melodic/api/std_msgs/html/msg/Bool.html
-    if msg_in.data:
-        rospy.loginfo("Setting output high!")
-        drop_square()
-    else:
-        rospy.loginfo("Setting output low!")
-        drop_rect()
+def _serve_drop(name, action):
+    """Run one drop under the lock and report what happened to the caller.
+
+    The whole point of using a service rather than a topic: the mission node
+    blocks until the rack has finished moving and finds out whether it worked,
+    instead of publishing into the void and guessing with a sleep.
+    """
+    if not drop_lock.acquire(blocking=False):
+        msg = "A drop is already in progress - ignoring {}".format(name)
+        rospy.logwarn(msg)
+        return TriggerResponse(success=False, message=msg)
+
+    try:
+        rospy.loginfo("Firing %s", name)
+        action()
+        return TriggerResponse(success=True, message="{} complete".format(name))
+    except Exception as e:
+        rospy.logerr("%s failed: %s", name, e)
+        return TriggerResponse(success=False, message=str(e))
+    finally:
+        drop_lock.release()
+
+
+def handle_drop_a(req):
+    return _serve_drop("drop_a (Payload A)", drop_rect)
+
+
+def handle_drop_b(req):
+    return _serve_drop("drop_b (Payload B)", drop_square)
 
 def shutdown():
-    # Clean up our ROS subscriber if they were set, avoids error messages in logs
-    if sub_a is not None:
-        sub_a.unregister()
+    # Clean up our ROS services if they were set, avoids error messages in logs
+    for srv in (srv_a, srv_b):
+        if srv is not None:
+            srv.shutdown()
 
     # Stop the pigpio daemon connection
     pi.stop()
@@ -83,8 +112,21 @@ if __name__ == '__main__':
     SERVO_GPIO = 13  # Adjust this to your GPIO pin
     # Setup the GPIO as output (done automatically when setting pulsewidth)
 
-    # Setup the subscriber for the actuator control topic
-    sub_a = rospy.Subscriber('/actuator_control/actuator_a', Bool, callback_a)
+    drop_lock = threading.Lock()
+
+    # Two explicit services rather than one topic carrying a bool. The old
+    # /actuator_control/actuator_a topic meant "false = Payload A, true =
+    # Payload B", which read as an on/off switch at every call site.
+    #
+    # Deliberately absolute, not private (~), names: the node is started with
+    # anonymous=True, so a private name would resolve to a different service
+    # every run and nothing could find it.
+    srv_a_name = rospy.get_param('~drop_a_service', '/actuator_control/drop_a')
+    srv_b_name = rospy.get_param('~drop_b_service', '/actuator_control/drop_b')
+
+    srv_a = rospy.Service(srv_a_name, Trigger, handle_drop_a)
+    srv_b = rospy.Service(srv_b_name, Trigger, handle_drop_b)
+    rospy.loginfo("Actuator services ready: %s, %s", srv_a_name, srv_b_name)
 
     # Register the shutdown hook
     rospy.on_shutdown(shutdown)
