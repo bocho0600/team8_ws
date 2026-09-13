@@ -98,6 +98,12 @@ docker run --rm hello-world
 
    This opens 12 panes: `roscore`, a system monitor, a free terminal, `control.launch` (MAVROS + `spar`), `combined_nodes.launch` (vision + servo), `qutas_lab_450 environment.launch` (vicon/optitrack), `breadcrumb.launch`, the ArUco mission node, two position monitors, `rosbag record`, and a staged kill switch. See the [full pane table](#run_uav_stack-uav) for what each one does and how to sanity-check it's working.
 
+   Every pane comes up **pre-typed but not running** — press Enter in a pane to start it, so you can bring the stack up one piece at a time (`roscore` first) and watch each node before adding the next. To fire everything at once instead, with the old staggered `sleep`s:
+
+   ```
+   run_uav_stack --run
+   ```
+
    To stop everything, switch to the kill-switch pane (bottom-right) and press Enter — it's pre-typed but not run automatically, so it can't tear the stack down by accident.
 
    Prefer to launch things one at a time instead? Any launch file works normally, e.g.:
@@ -153,7 +159,7 @@ docker run --rm hello-world
      gcs_tmux_sim
      ```
 
-   See the [full pane table](#gcs_tmux--gcs_tmux_sim-gcs) for what each pane does. Same kill-switch convention as the UAV: pre-typed, not auto-run — press Enter in that pane to tear the stack down.
+   See the [full pane table](#gcs_tmux--gcs_tmux_sim-gcs) for what each pane does. As with the UAV, panes are pre-typed but not started — press Enter in each to start it, or pass `--run` (`gcs_tmux --run`, `gcs_tmux_sim --run`) to start everything automatically. The kill switch is never auto-run either way.
 
 ### Troubleshooting connectivity
 
@@ -193,7 +199,7 @@ Opens a `uav_stack` tmux session with:
 | bag recording | `rosbag record -a` (written to `~/catkin_ws/bags/`) | — |
 | kill switch | `tmux kill-session -t uav_stack` staged, not run | Press Enter in this pane to tear the whole stack down |
 
-Each launch is staggered with a `sleep` so `roscore` and MAVROS are up before dependents start.
+By default every pane is pre-typed but idle — the table's order is the order to press Enter in. With `--run` (or `TMUX_AUTORUN=1`) the launches fire automatically, staggered with a `sleep` so `roscore` and MAVROS are up before dependents start.
 
 #### `gcs_tmux` / `gcs_tmux_sim` (GCS)
 
@@ -244,7 +250,7 @@ Two GitHub Actions workflows:
 ./ci/smoke-test.sh uavteam8/catkin_ws:latest
 ```
 
-It asserts the things that are easy to break silently: role dispatch (UAV stays self-mastered, GCS targets `UAV_IP`, bad role warns and falls back), that each role gets only its own launcher, that every launch file still resolves its includes, that the GUI tooling is present, and that the tmux kill-switch panes stay *staged* rather than armed.
+It asserts the things that are easy to break silently: role dispatch (UAV stays self-mastered, GCS targets `UAV_IP`, bad role warns and falls back), that each role gets only its own launcher, that every launch file still resolves its includes, that the GUI tooling is present, and that the tmux panes (the kill switch always, every other pane unless `--run` is passed) stay *staged* rather than armed.
 
 ### Using the prebuilt image
 

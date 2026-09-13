@@ -5,7 +5,16 @@
 # spar_uavasr.launch (spar node + software-in-the-loop uavasr emulator, so
 # mission logic can be exercised without a real drone), rviz, position
 # monitors, bag recording, and the rqt GUIs.
+#
+# Panes are pre-loaded but not started; press Enter in a pane to run it.
+# Pass --run to start everything automatically (staggered by sleeps).
 function gcs_tmux() {
+    local TMUX_AUTORUN
+    if ! TMUX_AUTORUN="$(_tmux_autorun "$1")"; then
+        echo "usage: gcs_tmux [--run]" >&2
+        return 1
+    fi
+
     echo "Starting GCS tmux session (session: gcs_stack)"
     tmux kill-session -t gcs_stack 2>/dev/null
 
@@ -13,7 +22,7 @@ function gcs_tmux() {
     tmux set-option -t gcs_stack mouse on
 
     p0=$(tmux display-message -p -t gcs_stack '#{pane_id}')
-    tmux send-keys -t "$p0" "roslaunch spar_node spar_uavasr.launch" C-m
+    _pane_cmd "$p0" 0 "roslaunch spar_node spar_uavasr.launch"
 
     # Columns first, then rows within each column — splitting rows before
     # columns only divides the single row you split, not the whole session.
@@ -21,27 +30,31 @@ function gcs_tmux() {
 
     # --- Left column: emulator launch | rosbag | local pos | vision pos ---
     p1=$(tmux split-window -d -v -p 75 -P -F '#{pane_id}' -t "$p0")
-    tmux send-keys -t "$p1" "sleep 3; mkdir -p $CATKIN_WS/bags && rosbag record -a -o $CATKIN_WS/bags/gcs" C-m
+    _pane_cmd "$p1" 3 "mkdir -p $CATKIN_WS/bags && rosbag record -a -o $CATKIN_WS/bags/gcs"
 
     p2=$(tmux split-window -d -v -p 66 -P -F '#{pane_id}' -t "$p1")
-    tmux send-keys -t "$p2" "sleep 3; rostopic echo /mavros/local_position/pose" C-m
+    _pane_cmd "$p2" 3 "rostopic echo /mavros/local_position/pose"
 
     p3=$(tmux split-window -d -v -t "$p2")
-    tmux send-keys -t "$p3" "sleep 3; rostopic echo /mavros/vision_pose/pose" C-m
+    _pane_cmd "$p3" 3 "rostopic echo /mavros/vision_pose/pose"
 
     # --- Right column: rviz | rqt_generic_hud | rqt_mavros_gui | kill switch ---
-    tmux send-keys -t "$p4" "sleep 3; rviz -d $CATKIN_WS/src/spar/spar_node/rviz/emulator_configuration.rviz" C-m
+    _pane_cmd "$p4" 3 "rviz -d $CATKIN_WS/src/spar/spar_node/rviz/emulator_configuration.rviz"
 
     p5=$(tmux split-window -d -v -p 66 -P -F '#{pane_id}' -t "$p4")
-    tmux send-keys -t "$p5" "sleep 5; rosrun rqt_generic_hud rqt_generic_hud" C-m
+    _pane_cmd "$p5" 5 "rosrun rqt_generic_hud rqt_generic_hud"
 
     p6=$(tmux split-window -d -v -p 50 -P -F '#{pane_id}' -t "$p5")
-    tmux send-keys -t "$p6" "sleep 5; rosrun rqt_mavros_gui rqt_mavros_gui" C-m
+    _pane_cmd "$p6" 5 "rosrun rqt_mavros_gui rqt_mavros_gui"
 
-    # Deliberately no C-m here: pre-loads the kill command without running
+    # Deliberately never auto-run: pre-loads the kill command without running
     # it, so the whole stack doesn't tear itself down the instant it starts.
     p7=$(tmux split-window -d -v -P -F '#{pane_id}' -t "$p6")
     tmux send-keys -t "$p7" "tmux kill-session -t gcs_stack"
+
+    if [ "$TMUX_AUTORUN" != "1" ]; then
+        echo "Panes are pre-loaded — press Enter in each one to start it (emulator first)."
+    fi
 
     tmux select-pane -t "$p0"
     tmux attach-session -t gcs_stack
@@ -52,7 +65,7 @@ function gcs_tmux() {
 function gcs_tmux_sim() {
     echo "Switching to a local ROS master for standalone SITL testing..."
     disros "$(hostname -I | cut -d' ' -f1)"
-    gcs_tmux
+    gcs_tmux "$@"
 }
 
 export -f gcs_tmux gcs_tmux_sim

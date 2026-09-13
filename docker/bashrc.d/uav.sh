@@ -5,7 +5,16 @@
 # roscore, MAVROS + spar flight control, vision pipeline, path planner,
 # vicon/optitrack bridge, the ArUco mission node, position monitors, and bag
 # recording — each in its own pane.
+#
+# Panes are pre-loaded but not started; press Enter in a pane to run it.
+# Pass --run to start everything automatically (staggered by sleeps).
 function run_uav_stack() {
+    local TMUX_AUTORUN
+    if ! TMUX_AUTORUN="$(_tmux_autorun "$1")"; then
+        echo "usage: run_uav_stack [--run]" >&2
+        return 1
+    fi
+
     echo "Starting UAV flight stack in tmux (session: uav_stack)"
     tmux kill-session -t uav_stack 2>/dev/null
 
@@ -22,46 +31,50 @@ function run_uav_stack() {
     tmux set-option -t uav_stack mouse on
 
     p0=$(tmux display-message -p -t uav_stack '#{pane_id}')
-    tmux send-keys -t "$p0" "roscore" C-m
+    _pane_cmd "$p0" 0 "roscore"
 
     # --- Row 1: roscore | system monitor | free terminal ---
     p1=$(tmux split-window -d -h -p 66 -P -F '#{pane_id}' -t "$p0")
-    tmux send-keys -t "$p1" "htop" C-m
+    _pane_cmd "$p1" 0 "htop"
 
     p2=$(tmux split-window -d -h -p 50 -P -F '#{pane_id}' -t "$p1")
     tmux send-keys -t "$p2" "cd $CATKIN_WS" C-m
 
     # --- Row 2: flight control | vision + servo | vicon/optitrack ---
     p3=$(tmux split-window -d -v -p 80 -P -F '#{pane_id}' -t "$p0")
-    tmux send-keys -t "$p3" "sleep 3; roslaunch $CATKIN_WS/launch/control.launch ${gcs_arg}" C-m
+    _pane_cmd "$p3" 3 "roslaunch $CATKIN_WS/launch/control.launch ${gcs_arg}"
 
     p4=$(tmux split-window -d -v -p 80 -P -F '#{pane_id}' -t "$p1")
-    tmux send-keys -t "$p4" "sleep 5; roslaunch $CATKIN_WS/launch/combined_nodes.launch" C-m
+    _pane_cmd "$p4" 5 "roslaunch $CATKIN_WS/launch/combined_nodes.launch"
 
     p5=$(tmux split-window -d -v -p 80 -P -F '#{pane_id}' -t "$p2")
-    tmux send-keys -t "$p5" "sleep 5; roslaunch qutas_lab_450 environment.launch vicon_server_dvp:=${VICON_SERVER_DVP}" C-m
+    _pane_cmd "$p5" 5 "roslaunch qutas_lab_450 environment.launch vicon_server_dvp:=${VICON_SERVER_DVP}"
 
     # --- Row 3: breadcrumb | ArUco mission (demo_ml) | local position ---
     p6=$(tmux split-window -d -v -p 60 -P -F '#{pane_id}' -t "$p3")
-    tmux send-keys -t "$p6" "sleep 8; roslaunch $CATKIN_WS/launch/breadcrumb.launch" C-m
+    _pane_cmd "$p6" 8 "roslaunch $CATKIN_WS/launch/breadcrumb.launch"
 
     p7=$(tmux split-window -d -v -p 60 -P -F '#{pane_id}' -t "$p4")
-    tmux send-keys -t "$p7" "sleep 10; rosrun spar_node demo_ml" C-m
+    _pane_cmd "$p7" 10 "rosrun spar_node demo_ml"
 
     p8=$(tmux split-window -d -v -p 60 -P -F '#{pane_id}' -t "$p5")
-    tmux send-keys -t "$p8" "sleep 10; rostopic echo /mavros/local_position/pose" C-m
+    _pane_cmd "$p8" 10 "rostopic echo /mavros/local_position/pose"
 
     # --- Row 4: vision pose | rosbag record | kill session ---
     p9=$(tmux split-window -d -v -P -F '#{pane_id}' -t "$p6")
-    tmux send-keys -t "$p9" "sleep 10; rostopic echo /mavros/vision_pose/pose" C-m
+    _pane_cmd "$p9" 10 "rostopic echo /mavros/vision_pose/pose"
 
     p10=$(tmux split-window -d -v -P -F '#{pane_id}' -t "$p7")
-    tmux send-keys -t "$p10" "sleep 10; mkdir -p $CATKIN_WS/bags && rosbag record -a -o $CATKIN_WS/bags/flight" C-m
+    _pane_cmd "$p10" 10 "mkdir -p $CATKIN_WS/bags && rosbag record -a -o $CATKIN_WS/bags/flight"
 
-    # Deliberately no C-m here: pre-loads the kill command without running
+    # Deliberately never auto-run: pre-loads the kill command without running
     # it, so the whole stack doesn't tear itself down the instant it starts.
     p11=$(tmux split-window -d -v -P -F '#{pane_id}' -t "$p8")
     tmux send-keys -t "$p11" "tmux kill-session -t uav_stack"
+
+    if [ "$TMUX_AUTORUN" != "1" ]; then
+        echo "Panes are pre-loaded — press Enter in each one to start it (roscore first)."
+    fi
 
     tmux select-pane -t "$p0"
     tmux attach-session -t uav_stack

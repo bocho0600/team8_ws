@@ -85,6 +85,14 @@ expect "run_uav_stack kill pane is staged, not armed" "yes" uav \
     'declare -f run_uav_stack | grep send-keys | grep kill-session | grep -qv C-m && echo yes'
 expect "gcs_tmux kill pane is staged, not armed" "yes" gcs \
     'declare -f gcs_tmux | grep send-keys | grep kill-session | grep -qv C-m && echo yes'
+# Panes default to staged (pre-typed, press Enter to run); --run arms them and
+# restores the staggered sleeps. tmux is stubbed so this is assertable headless.
+expect "panes are staged by default" "yes" uav \
+    'tmux() { echo "$*"; }; [ "$(_pane_cmd %0 5 "roslaunch foo")" = "send-keys -t %0 roslaunch foo" ] && echo yes'
+expect "autorun arms panes with staggered sleeps" "yes" uav \
+    'tmux() { echo "$*"; }; TMUX_AUTORUN=1; [ "$(_pane_cmd %0 5 "roslaunch foo")" = "send-keys -t %0 sleep 5; roslaunch foo C-m" ] && echo yes'
+expect "--run flag parses, junk flags rejected" "1 0 bad" uav \
+    'echo "$(_tmux_autorun --run) $(_tmux_autorun) $(_tmux_autorun --nope || echo bad)"'
 
 if [ "$FAILED" -ne 0 ]; then
     echo "smoke test FAILED"

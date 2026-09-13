@@ -100,7 +100,32 @@ function aruco_frames() {
     echo "  check the demo_ml terminal for 'Target frames found during scan'"
 }
 
+# --- tmux launcher helpers ---------------------------------------------------
+# By default the tmux panes are pre-loaded with their command but don't run it,
+# so you can bring the stack up piece by piece (press Enter in a pane to start
+# it). Pass --run to a launcher (or set TMUX_AUTORUN=1) for the old
+# fire-everything-at-once behaviour, where the staggered sleeps matter.
+_pane_cmd() {
+    local pane="$1" delay="$2" cmd="$3"
+    if [ "${TMUX_AUTORUN:-0}" = "1" ]; then
+        [ "${delay:-0}" -gt 0 ] && cmd="sleep ${delay}; ${cmd}"
+        tmux send-keys -t "$pane" "$cmd" C-m
+    else
+        tmux send-keys -t "$pane" "$cmd"
+    fi
+}
+
+# Shared launcher argument parsing: echoes the TMUX_AUTORUN value to use.
+_tmux_autorun() {
+    case "${1:-}" in
+        --run|-r) echo 1 ;;
+        "")       echo "${TMUX_AUTORUN:-0}" ;;
+        *)        return 1 ;;
+    esac
+}
+
 export -f disros servo_open1 servo_open2 _aruco_frame_arg aruco_land aruco_roi aruco_land_point aruco_frames
+export -f _pane_cmd _tmux_autorun
 
 # --- Role-specific tmux launcher --------------------------------------------
 # shellcheck source=/dev/null
