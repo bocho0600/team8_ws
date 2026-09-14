@@ -24,6 +24,11 @@ from image_processing.msg import TargetDetection, TargetDetectionArray
 cam_source = 'rgb'
 syncNN = True
 
+# Camera runs at full rate; detection only runs on every Nth frame to save
+# compute/power. Video output stays decoupled from detection cadence.
+CAM_FPS = 30
+DETECT_EVERY_N = 3
+
 # model path - update these to match your converted YOLOv11 blob folder
 rospack = rospkg.RosPack()
 configPath = Path(rospack.get_path('image_processing') + '/models/best_openvino_2022.1_6shave/best.json')
@@ -64,12 +69,9 @@ class DepthaiCamera():
         if "input_size" in nnConfig:
             self.nn_shape_w, self.nn_shape_h = tuple(map(int, nnConfig.get("input_size").split('x')))
 
-        # queue_size=1 on the image streams: these are live video, so a
-        # backlog is never worth keeping. At 10fps a depth of 10 buys up to a
-        # second of extra lag whenever the link can't keep up.
-        self.pub_image = rospy.Publisher(self.pub_topic, CompressedImage, queue_size=1)
-        self.pub_image_raw = rospy.Publisher(self.pub_topic_raw, Image, queue_size=1)
-        self.pub_image_detect = rospy.Publisher(self.pub_topic_detect, CompressedImage, queue_size=1)
+        self.pub_image = rospy.Publisher(self.pub_topic, CompressedImage, queue_size=10)
+        self.pub_image_raw = rospy.Publisher(self.pub_topic_raw, Image, queue_size=10)
+        self.pub_image_detect = rospy.Publisher(self.pub_topic_detect, CompressedImage, queue_size=10)
         self.pub_cam_inf = rospy.Publisher(self.pub_topic_cam_inf, CameraInfo, queue_size=10)
         self.pub_targets = rospy.Publisher(self.pub_topic_targets, TargetDetectionArray, queue_size=10)
 
@@ -151,15 +153,11 @@ class DepthaiCamera():
 
                 device.startPipeline(pipeline)
 
-                # maxSize=1, not 4. These are non-blocking queues, so a full
-                # queue overwrites the oldest entry - but get() still returns
-                # the oldest one held. With a depth of 4 and a host loop that
-                # can't keep up with 10fps, the queue sits permanently full and
-                # every frame read is ~4 frames (~400ms) stale, forever. Depth
-                # 1 means "always the newest frame", trading dropped frames for
-                # latency, which is the right trade for flight.
-                q_nn_input = device.getOutputQueue(name="nn_input", maxSize=1, blocking=False)
-                q_nn = device.getOutputQueue(name="nn", maxSize=1, blocking=False)
+                # Full-rate video, independent of detection cadence
+                q_video = device.getOutputQueue(name="video", maxSize=4, blocking=False)
+                # Detection output arrives at the decimated rate (every DETECT_EVERY_N frames)
+                q_nn_input = device.getOutputQueue(name="nn_input", maxSize=4, blocking=False)
+                q_nn = device.getOutputQueue(name="nn", maxSize=4, blocking=False)
 
                 frame = None
                 detections = []
@@ -168,32 +166,33 @@ class DepthaiCamera():
                 fps = 0
 
                 while not rospy.is_shutdown():
+                    # Publish full-rate video regardless of whether a new
+                    # detection is available this loop iteration.
+                    inVideo = q_video.tryGet()
+                    if inVideo is not None:
+                        self.publish_to_ros(inVideo.getCvFrame())
+
                     found_classes = []
-                    inRgb = q_nn_input.get()
-                    inDet = q_nn.get()
+                    inRgb = q_nn_input.tryGet()
+                    inDet = q_nn.tryGet()
 
-                    if inRgb is not None:
-                        frame = inRgb.getCvFrame()
-                    else:
-                        print("Cam Image empty, trying again...")
+                    if inRgb is None or inDet is None:
+                        # Nothing new from the decimated detection path this
+                        # iteration - not an error, just avoid busy-looping.
+                        rospy.sleep(0.001)
                         continue
 
-                    if inDet is not None:
-                        detections = inDet.detections
-                        for detection in detections:
-                            found_classes.append(detection.label)
-                        found_classes = np.unique(found_classes)
-                        overlay = self.show_yolo(frame, detections)
-                    else:
-                        print("Detection empty, trying again...")
-                        continue
+                    frame = inRgb.getCvFrame()
+                    detections = inDet.detections
+                    for detection in detections:
+                        found_classes.append(detection.label)
+                    found_classes = np.unique(found_classes)
+                    overlay = self.show_yolo(frame, detections)
 
-                    if frame is not None:
-                        cv2.putText(overlay, "NN fps: {:.2f}".format(fps), (2, overlay.shape[0] - 4), cv2.FONT_HERSHEY_TRIPLEX, 0.4, (255, 0, 0))
-                        cv2.putText(overlay, "Found classes {}".format(found_classes), (2, 10), cv2.FONT_HERSHEY_TRIPLEX, 0.4, (255, 0, 0))
-                        self.publish_to_ros(frame)
-                        self.publish_detect_to_ros(overlay)
-                        self.publish_targets(detections)
+                    cv2.putText(overlay, "NN fps: {:.2f}".format(fps), (2, overlay.shape[0] - 4), cv2.FONT_HERSHEY_TRIPLEX, 0.4, (255, 0, 0))
+                    cv2.putText(overlay, "Found classes {}".format(found_classes), (2, 10), cv2.FONT_HERSHEY_TRIPLEX, 0.4, (255, 0, 0))
+                    self.publish_detect_to_ros(overlay)
+                    self.publish_targets(detections)
 
                     counter += 1
                     if (time.time() - start_time) > 1:
@@ -220,14 +219,6 @@ class DepthaiCamera():
         msg_out.header.frame_id = "home"
         msg_out.data = np.array(cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 60])[1]).tobytes()
         self.pub_image.publish(msg_out)
-
-        # The uncompressed stream is 640*640*3 = 1.2MB per frame, ~98Mbps at
-        # 10fps - enough to saturate the WiFi link to the GCS on its own and
-        # push every other topic into a backlog. Only pay for it (both the
-        # tobytes() copy and the bandwidth) when something is actually
-        # listening. Prefer the /compressed topic for viewing.
-        if self.pub_image_raw.get_num_connections() == 0:
-            return
 
         # NOTE: cv_bridge's cv2_to_imgmsg() hits a KeyError on some
         # ROS Noetic + numpy combinations (numpy dtype hashing changed in
@@ -317,9 +308,34 @@ class DepthaiCamera():
         cam = pipeline.create(dai.node.ColorCamera)
         cam.setPreviewSize(self.nn_shape_w, self.nn_shape_h)
         cam.setInterleaved(False)
-        cam.preview.link(detection_nn.input)
         cam.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
-        cam.setFps(10)
+        cam.setFps(CAM_FPS)
+
+        # Script node gates which frames reach the NN, decoupling video fps
+        # from detection fps. Camera now runs at CAM_FPS; the NN only sees
+        # every DETECT_EVERY_N-th frame, saving compute/power without
+        # throttling the video/ROS stream.
+        script = pipeline.create(dai.node.Script)
+        cam.preview.link(script.inputs['frames'])
+        script.inputs['frames'].setBlocking(False)
+        script.inputs['frames'].setQueueSize(1)
+        script.setScript(f"""
+frame_count = 0
+DETECT_EVERY_N = {DETECT_EVERY_N}
+while True:
+    frame = node.io['frames'].get()
+    frame_count += 1
+    if frame_count % DETECT_EVERY_N == 0:
+        node.io['to_nn'].send(frame)
+""")
+        script.outputs['to_nn'].link(detection_nn.input)
+
+        # Full-rate video output for ROS - taps the camera directly, so it's
+        # unaffected by the detection decimation above.
+        xout_video = pipeline.create(dai.node.XLinkOut)
+        xout_video.setStreamName("video")
+        xout_video.input.setBlocking(False)
+        cam.preview.link(xout_video.input)
 
         mono_left = pipeline.create(dai.node.MonoCamera)
         mono_left.setBoardSocket(dai.CameraBoardSocket.CAM_B)
@@ -329,6 +345,10 @@ class DepthaiCamera():
         mono_right.setBoardSocket(dai.CameraBoardSocket.CAM_C)
         mono_right.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
 
+        # Left at 10fps deliberately - depth only needs to be fresh at the
+        # moments the NN actually runs (every DETECT_EVERY_N-th frame), so
+        # there's no benefit to matching CAM_FPS here and it would just add
+        # extra USB bandwidth/compute for nothing.
         mono_left.setFps(10)
         mono_right.setFps(10)
         stereo = pipeline.create(dai.node.StereoDepth)
