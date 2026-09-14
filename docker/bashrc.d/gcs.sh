@@ -97,7 +97,7 @@ function gcs_tmux_standalone() {
     # immediately so no pane ever shrinks below what the next split needs.
     # tmux's "tiled" layout picks the grid shape itself — for a 220x60
     # session with 12 panes that comes out to 4 columns x 3 rows.
-    for i in $(seq 1 11); do
+    for _ in $(seq 1 11); do
         local new_pane
         new_pane=$(tmux split-window -d -P -F '#{pane_id}' -t "${panes[0]}")
         panes+=("$new_pane")
