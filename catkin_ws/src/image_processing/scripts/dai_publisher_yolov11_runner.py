@@ -14,9 +14,8 @@ import numpy as np
 import depthai as dai
 import rospy
 import rospkg
-from sensor_msgs.msg import CompressedImage, Image, CameraInfo
+from sensor_msgs.msg import CompressedImage, CameraInfo
 from geometry_msgs.msg import Point
-from cv_bridge import CvBridge, CvBridgeError
 
 from image_processing.msg import TargetDetection, TargetDetectionArray
 
@@ -25,9 +24,13 @@ cam_source = 'rgb'
 syncNN = True
 
 # Camera runs at full rate; detection only runs on every Nth frame to save
-# compute/power. Video output stays decoupled from detection cadence.
-CAM_FPS = 10
-DETECT_EVERY_N = 5
+# compute/power. Video output stays decoupled from detection cadence and is
+# encoded on-device (VideoEncoder) so the Pi never touches raw video pixels.
+CAM_FPS = 30
+DETECT_EVERY_N = 3
+JPEG_QUALITY = 60          # used for the detection-overlay stream only;
+                           # the main video stream is hardware MJPEG-encoded
+VIDEO_WIDTH, VIDEO_HEIGHT = 1280, 720
 
 # model path - update these to match your converted YOLOv11 blob folder
 rospack = rospkg.RosPack()
@@ -57,8 +60,12 @@ labels = nnMappings.get("labels", {})
 class DepthaiCamera():
     fps = 10
 
+    # NOTE: /depthai_node/image/raw (uncompressed sensor_msgs/Image) has been
+    # removed - nothing subscribes to it over WiFi, and building it every
+    # frame (frame.tobytes() on a full raw image) cost real CPU for no
+    # consumer. Re-add it only if something local on the Pi actually needs
+    # raw pixels; even then, consider gating it behind a subscriber check.
     pub_topic = '/depthai_node/image/compressed'
-    pub_topic_raw = '/depthai_node/image/raw'
     pub_topic_detect = '/depthai_node/detection/compressed'
     pub_topic_cam_inf = '/depthai_node/camera/camera_info'
     pub_topic_targets = '/target_detections/yolo'
@@ -70,7 +77,6 @@ class DepthaiCamera():
             self.nn_shape_w, self.nn_shape_h = tuple(map(int, nnConfig.get("input_size").split('x')))
 
         self.pub_image = rospy.Publisher(self.pub_topic, CompressedImage, queue_size=10)
-        self.pub_image_raw = rospy.Publisher(self.pub_topic_raw, Image, queue_size=10)
         self.pub_image_detect = rospy.Publisher(self.pub_topic_detect, CompressedImage, queue_size=10)
         self.pub_cam_inf = rospy.Publisher(self.pub_topic_cam_inf, CameraInfo, queue_size=10)
         self.pub_targets = rospy.Publisher(self.pub_topic_targets, TargetDetectionArray, queue_size=10)
@@ -84,8 +90,6 @@ class DepthaiCamera():
         self.timer = rospy.Timer(rospy.Duration(1.0 / 10), self.publish_camera_info, oneshot=False)
 
         rospy.loginfo("Publishing images to rostopic: {}".format(self.pub_topic))
-
-        self.br = CvBridge()
 
         rospy.on_shutdown(lambda: self.shutdown())
 
@@ -149,37 +153,38 @@ class DepthaiCamera():
                     raise RuntimeError(
                         "Stereo pair not available on this device - spatial detection needs LEFT+RIGHT mono cameras. Available cameras: {}".format(cams))
 
+                rospy.loginfo("USB speed: {}".format(device.getUsbSpeed()))
+
                 self.read_calibration(device)
 
                 device.startPipeline(pipeline)
 
-                # Full-rate video, independent of detection cadence
-                q_video = device.getOutputQueue(name="video", maxSize=4, blocking=False)
-                # Detection output arrives at the decimated rate (every DETECT_EVERY_N frames)
+                # Video queue is blocking - it's what paces the main loop now,
+                # since it's the highest-rate stream (CAM_FPS). Small maxSize
+                # keeps latency bounded rather than letting frames queue up.
+                q_video = device.getOutputQueue(name="video", maxSize=4, blocking=True)
+                # Detection output arrives at the decimated rate - tryGet()
+                # so it never blocks the video pacing above.
                 q_nn_input = device.getOutputQueue(name="nn_input", maxSize=4, blocking=False)
                 q_nn = device.getOutputQueue(name="nn", maxSize=4, blocking=False)
 
-                frame = None
                 detections = []
                 start_time = time.time()
                 counter = 0
                 fps = 0
 
                 while not rospy.is_shutdown():
-                    # Publish full-rate video regardless of whether a new
-                    # detection is available this loop iteration.
-                    inVideo = q_video.tryGet()
-                    if inVideo is not None:
-                        self.publish_to_ros(inVideo.getCvFrame())
+                    # Blocks (briefly, ~1/CAM_FPS) rather than busy-polling.
+                    # This is already hardware-encoded MJPEG bytes - no
+                    # cv2.imencode needed on the Pi for this stream.
+                    inVideo = q_video.get()
+                    self.publish_to_ros(bytes(inVideo.getData()))
 
                     found_classes = []
                     inRgb = q_nn_input.tryGet()
                     inDet = q_nn.tryGet()
 
                     if inRgb is None or inDet is None:
-                        # Nothing new from the decimated detection path this
-                        # iteration - not an error, just avoid busy-looping.
-                        rospy.sleep(0.001)
                         continue
 
                     frame = inRgb.getCvFrame()
@@ -212,36 +217,22 @@ class DepthaiCamera():
             self.dist_coeffs = None
             rospy.sleep(2.0)  # brief backoff before main() retries run()
 
-    def publish_to_ros(self, frame):
+    def publish_to_ros(self, jpeg_bytes):
+        # jpeg_bytes comes pre-encoded from the on-device VideoEncoder -
+        # no cv2.imencode here, this is just message construction.
         msg_out = CompressedImage()
         msg_out.header.stamp = rospy.Time.now()
         msg_out.format = "jpeg"
         msg_out.header.frame_id = "home"
-        msg_out.data = np.array(cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 60])[1]).tobytes()
+        msg_out.data = jpeg_bytes
         self.pub_image.publish(msg_out)
-
-        # NOTE: cv_bridge's cv2_to_imgmsg() hits a KeyError on some
-        # ROS Noetic + numpy combinations (numpy dtype hashing changed in
-        # numpy 1.24+, breaking cv_bridge's internal type lookup table).
-        # Building the Image message manually sidesteps cv_bridge entirely
-        # so this works regardless of the numpy version installed.
-        msg_img_raw = Image()
-        msg_img_raw.header.stamp = msg_out.header.stamp
-        msg_img_raw.header.frame_id = "home"
-        msg_img_raw.height = frame.shape[0]
-        msg_img_raw.width = frame.shape[1]
-        msg_img_raw.encoding = "bgr8"
-        msg_img_raw.is_bigendian = 0
-        msg_img_raw.step = frame.shape[1] * frame.shape[2]
-        msg_img_raw.data = frame.tobytes()
-        self.pub_image_raw.publish(msg_img_raw)
 
     def publish_detect_to_ros(self, frame):
         msg_out = CompressedImage()
         msg_out.header.stamp = rospy.Time.now()
         msg_out.format = "jpeg"
         msg_out.header.frame_id = "home"
-        msg_out.data = np.array(cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 60])[1]).tobytes()
+        msg_out.data = np.array(cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])[1]).tobytes()
         self.pub_image_detect.publish(msg_out)
 
     def publish_targets(self, detections):
@@ -296,7 +287,10 @@ class DepthaiCamera():
         detection_nn.setAnchorMasks(anchorMasks)
         detection_nn.setIouThreshold(iouThreshold)
         detection_nn.setBlobPath(nnPath)
-        detection_nn.setNumPoolFrames(2)
+        # Bumped from 2 -> 4: at CAM_FPS=30 with detection now only running on
+        # a subset of frames, a small pool could stall the NN waiting for a
+        # buffer to free between inference runs.
+        detection_nn.setNumPoolFrames(4)
         detection_nn.input.setBlocking(False)
         detection_nn.setNumInferenceThreads(2)
         # How much of the detected bbox to sample depth from (0.5 = middle 50%,
@@ -310,6 +304,7 @@ class DepthaiCamera():
         cam.setInterleaved(False)
         cam.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
         cam.setFps(CAM_FPS)
+        cam.setVideoSize(VIDEO_WIDTH, VIDEO_HEIGHT)
 
         # Script node gates which frames reach the NN, decoupling video fps
         # from detection fps. Camera now runs at CAM_FPS; the NN only sees
@@ -330,12 +325,19 @@ while True:
 """)
         script.outputs['to_nn'].link(detection_nn.input)
 
-        # Full-rate video output for ROS - taps the camera directly, so it's
-        # unaffected by the detection decimation above.
+        # Video is encoded to MJPEG on-device via VideoEncoder, so the Pi's
+        # CPU never runs cv2.imencode on the main video stream - it just
+        # relays already-compressed bytes. Uses cam.video (full VIDEO_WIDTH x
+        # VIDEO_HEIGHT), independent of the small NN preview and its
+        # detection decimation.
+        videoEnc = pipeline.create(dai.node.VideoEncoder)
+        videoEnc.setDefaultProfilePreset(CAM_FPS, dai.VideoEncoderProperties.Profile.MJPEG)
+        cam.video.link(videoEnc.input)
+
         xout_video = pipeline.create(dai.node.XLinkOut)
         xout_video.setStreamName("video")
         xout_video.input.setBlocking(False)
-        cam.preview.link(xout_video.input)
+        videoEnc.bitstream.link(xout_video.input)
 
         mono_left = pipeline.create(dai.node.MonoCamera)
         mono_left.setBoardSocket(dai.CameraBoardSocket.CAM_B)
