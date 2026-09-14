@@ -26,8 +26,8 @@ syncNN = True
 
 # Camera runs at full rate; detection only runs on every Nth frame to save
 # compute/power. Video output stays decoupled from detection cadence.
-CAM_FPS = 30
-DETECT_EVERY_N = 3
+CAM_FPS = 10
+DETECT_EVERY_N = 5
 
 # model path - update these to match your converted YOLOv11 blob folder
 rospack = rospkg.RosPack()
