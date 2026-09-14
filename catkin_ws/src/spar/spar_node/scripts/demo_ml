@@ -88,6 +88,14 @@ ROI_HEIGHT = 1.5
 # actuator, before resuming the scan.
 ACTUATOR_HOLD = 2.0
 
+# Altitude the UAV drops the payload from, once it is over the target.
+DIVERSION_HEIGHT = 1.0
+
+# Horizontal/vertical speed for the whole diversion manoeuvre. Slower
+# than the scan legs on purpose - this is a precision approach over a
+# target, not open-ground coverage.
+DIVERSION_SPEED = 0.3
+
 # True  -> resolve_frame() uses a live map -> frame TF lookup first,
 #          falling back to the averaged detection estimate.
 # False -> the reverse.
@@ -122,13 +130,17 @@ def send_wp(
         y,
         z,
         yaw,
-        wait_time=2.0):
+        wait_time=2.0,
+        speed=None):
 
-    # NOTE: keep this default in sync with send_wp_scan().
-    speed = rospy.get_param(
-        "~speed",
-        0.5
-    )
+    # Transit/diversion speed. Deliberately lower than send_wp_scan()'s
+    # scan-leg speed: these moves approach a target rather than sweep
+    # open ground. Pass speed= to override for one call.
+    if speed is None:
+        speed = rospy.get_param(
+            "~speed",
+            0.5
+        )
 
     accuracy = rospy.get_param(
         "~accuracy",
@@ -180,12 +192,14 @@ def send_wp(
 
 
 def yolo_callback(msg):
-    """Queue an actuator drop the first time a target label appears.
+    """Queue a diversion, and keep a running map-frame estimate of where
+    the target is.
 
-    Deliberately does NOT touch TF. person/backpack detections are
-    acted on where the UAV is standing, so there is nothing to
-    transform into the map frame - which also means this path is
-    immune to a wrong camera mount transform.
+    The estimate is what handle_diversion() flies to. It goes through the
+    same TF path as ArUco, so a wrong uavteam8 -> camera mount transform
+    now affects this path too - it did not when the drop happened in
+    place. Every sighting is averaged in, so a single noisy frame does
+    not decide where the UAV goes.
     """
 
     for detection in msg.detections:
@@ -194,6 +208,14 @@ def yolo_callback(msg):
 
         if label not in DIVERSION_ACTUATOR:
             continue
+
+        position = detection_to_map(msg, detection)
+
+        if position is not None:
+            update_frame_estimate(
+                frame_name_for(detection),
+                position
+            )
 
         with state_lock:
 
@@ -692,67 +714,92 @@ def frame_name_for(detection):
     if detection.label == "aruco":
         return "target_aruco_{}".format(detection.marker_id)
 
-    return "target_{}".format(detection.label)
+    return frame_name_for_label(detection.label)
+
+
+def frame_name_for_label(label):
+    """Same naming, from a bare YOLO label.
+
+    pending_diversions stores labels, not detections, so the diversion
+    handler needs this to look the estimate back up.
+    """
+
+    return "target_{}".format(label)
+
+
+def detection_to_map(msg, detection):
+    """Map-frame [x, y, z] for one detection, or None if TF can't do it.
+
+    Shared by the ArUco and YOLO callbacks - both need the same camera ->
+    map transform, and having one copy means a camera-mount problem shows
+    up identically on both paths instead of only one.
+    """
+
+    if tf_buffer is None:
+        return None
+
+    source_frame = msg.header.frame_id
+
+    if not source_frame:
+        source_frame = CAMERA_FRAME
+
+    if not source_frame:
+
+        rospy.logwarn_throttle(
+            5.0,
+            "Detection has no frame_id and ~camera_frame "
+            "is not set - cannot transform to %s.",
+            MAP_FRAME
+        )
+
+        return None
+
+    point_cam = PointStamped()
+
+    point_cam.header.stamp = msg.header.stamp
+    point_cam.header.frame_id = source_frame
+
+    point_cam.point = detection.position
+
+    try:
+
+        point_map = tf_buffer.transform(
+            point_cam,
+            MAP_FRAME,
+            rospy.Duration(0.2)
+        )
+
+    except tf2_ros.TransformException as e:
+
+        rospy.logwarn_throttle(
+            5.0,
+            "Could not transform detection from %s to %s: %s",
+            source_frame,
+            MAP_FRAME,
+            e
+        )
+
+        return None
+
+    return [
+        point_map.point.x,
+        point_map.point.y,
+        point_map.point.z
+    ]
 
 
 def detection_callback(msg):
 
-    if tf_buffer is None:
-        return
-
     for detection in msg.detections:
 
-        source_frame = msg.header.frame_id
+        position = detection_to_map(msg, detection)
 
-        if not source_frame:
-            source_frame = CAMERA_FRAME
-
-        if not source_frame:
-
-            rospy.logwarn_throttle(
-                5.0,
-                "Detection has no frame_id and ~camera_frame "
-                "is not set - cannot transform to %s.",
-                MAP_FRAME
-            )
-
-            return
-
-        point_cam = PointStamped()
-
-        point_cam.header.stamp = msg.header.stamp
-        point_cam.header.frame_id = source_frame
-
-        point_cam.point = detection.position
-
-        try:
-
-            point_map = tf_buffer.transform(
-                point_cam,
-                MAP_FRAME,
-                rospy.Duration(0.2)
-            )
-
-        except tf2_ros.TransformException as e:
-
-            rospy.logwarn_throttle(
-                5.0,
-                "Could not transform detection from %s to %s: %s",
-                source_frame,
-                MAP_FRAME,
-                e
-            )
-
+        if position is None:
             return
 
         update_frame_estimate(
             frame_name_for(detection),
-
-            [
-                point_map.point.x,
-                point_map.point.y,
-                point_map.point.z
-            ]
+            position
         )
 
 
@@ -1026,14 +1073,8 @@ def log_frame_summary():
 # handled, and return so the scan can resume.
 # ============================================================
 
-def handle_diversion(actuator_srvs, label):
-    """Fire the actuator for a detected target, in place.
-
-    No TF, no navigation: send_wp_scan() has already cancelled the
-    waypoint and stopped the UAV, and the target is directly beneath
-    the camera, so the drop happens here. The label is then added to
-    handled_targets and every later sighting is ignored.
-    """
+def fire_actuator(actuator_srvs, label):
+    """Call the servo service for a label. Never raises."""
 
     which = DIVERSION_ACTUATOR[label]
     call = actuator_srvs[which]
@@ -1043,7 +1084,7 @@ def handle_diversion(actuator_srvs, label):
     )
 
     rospy.loginfo(
-        "TARGET '%s' - firing actuator in place: %s",
+        "TARGET '%s' - firing actuator: %s",
         label,
         which
     )
@@ -1068,8 +1109,165 @@ def handle_diversion(actuator_srvs, label):
     if ACTUATOR_HOLD > 0.0:
         rospy.sleep(ACTUATOR_HOLD)
 
+
+def handle_diversion(spar_client, actuator_srvs, label, scan_height):
+    """Fly to a detected target, descend, drop, climb back, resume.
+
+    send_wp_scan() has already cancelled the scan leg and stopped the UAV,
+    so this starts from a stationary hover. The sequence is:
+
+        1. move to the target's x/y at the scan altitude
+        2. descend to DIVERSION_HEIGHT
+        3. fire the actuator
+        4. climb back to the scan altitude
+
+    Every leg runs at DIVERSION_SPEED. The climb in step 4 matters: the
+    scan segment is re-planned from current_mission_position afterwards,
+    and resuming from 1 m would fly the rest of the lawnmower at the wrong
+    height.
+
+    The label is marked handled whatever happens - a target that cannot be
+    reached must not re-trigger on the next sighting and stall the scan in
+    a loop. Returns False only if the UAV could not be recovered to the
+    scan altitude, which is not safe to keep flying from.
+    """
+
+    global current_mission_position
+
+    position = resolve_frame(frame_name_for_label(label))
+
+    if position is None:
+
+        # No usable estimate - almost always the camera -> map TF chain.
+        # Fall back to the old behaviour rather than skipping the target:
+        # the UAV is stopped directly over it, so dropping here is the
+        # best available guess.
+        rospy.logwarn(
+            "No map-frame estimate for '%s' - dropping in place instead "
+            "of flying to it. Check the camera mount transform.",
+            label
+        )
+
+        fire_actuator(actuator_srvs, label)
+
+        with state_lock:
+            handled_targets.add(label)
+
+        return True
+
+    rospy.loginfo(
+        "================================================"
+    )
+
+    rospy.loginfo(
+        "TARGET '%s' at [%.2f, %.2f, %.2f] - diverting.",
+        label,
+        position[0],
+        position[1],
+        position[2]
+    )
+
+    rospy.loginfo(
+        "================================================"
+    )
+
+    # --------------------------------------------------------
+    # 1. Move over the target, still at scan altitude
+    # --------------------------------------------------------
+
+    if not send_wp(
+            spar_client,
+            position[0],
+            position[1],
+            scan_height,
+            0.0,
+            wait_time=1.0,
+            speed=DIVERSION_SPEED):
+
+        rospy.logerr(
+            "Could not reach '%s' - abandoning this diversion.",
+            label
+        )
+
+        with state_lock:
+            handled_targets.add(label)
+
+        return True
+
+    # --------------------------------------------------------
+    # 2. Descend to drop height
+    # --------------------------------------------------------
+
+    rospy.loginfo(
+        "Descending to %.2f m over '%s'...",
+        DIVERSION_HEIGHT,
+        label
+    )
+
+    descended = send_wp(
+        spar_client,
+        position[0],
+        position[1],
+        DIVERSION_HEIGHT,
+        0.0,
+        wait_time=1.0,
+        speed=DIVERSION_SPEED
+    )
+
+    if not descended:
+
+        rospy.logerr(
+            "Failed to descend over '%s' - dropping from %.2f m instead.",
+            label,
+            scan_height
+        )
+
+    # --------------------------------------------------------
+    # 3. Drop
+    # --------------------------------------------------------
+
+    fire_actuator(actuator_srvs, label)
+
+    # --------------------------------------------------------
+    # 4. Climb back to scan altitude before resuming
+    # --------------------------------------------------------
+
+    if descended:
+
+        rospy.loginfo(
+            "Climbing back to %.2f m...",
+            scan_height
+        )
+
+        if not send_wp(
+                spar_client,
+                position[0],
+                position[1],
+                scan_height,
+                0.0,
+                wait_time=1.0,
+                speed=DIVERSION_SPEED):
+
+            rospy.logerr(
+                "Failed to climb back to scan altitude after '%s'.",
+                label
+            )
+
+            return False
+
     with state_lock:
+
         handled_targets.add(label)
+
+        # The scan segment is re-planned from here, so it has to be
+        # where the UAV actually is - over the target, not back on the
+        # lawnmower line.
+        current_mission_position = [
+            position[0],
+            position[1],
+            scan_height,
+            0.0
+        ]
 
     rospy.loginfo(
         "Drop for '%s' complete - resuming scan.",
@@ -1871,12 +2069,21 @@ def send_wps(
 
                 if label is not None:
 
-                    # The UAV stopped where it is and the drop
-                    # happens there, so there is no detour to
-                    # recover from. The segment is simply re-planned
-                    # from here to its endpoint, which loses no scan
-                    # coverage because the UAV has not skipped ahead.
-                    handle_diversion(actuator_srvs, label)
+                    # The diversion flies off the lawnmower line to the
+                    # target and back up to `height`, so it DOES leave a
+                    # detour to recover from. handle_diversion() updates
+                    # current_mission_position to where it left the UAV,
+                    # and the segment is re-planned from there to its
+                    # original endpoint - so the leg is finished rather
+                    # than skipped, and no coverage is lost.
+                    if not handle_diversion(
+                            spar_client,
+                            actuator_srvs,
+                            label,
+                            height):
+
+                        success = False
+                        break
 
                     diverted = True
                     break
@@ -1925,7 +2132,14 @@ def send_wps(
                 "Handling target queued during the final leg."
             )
 
-            handle_diversion(actuator_srvs, label)
+            if not handle_diversion(
+                    spar_client,
+                    actuator_srvs,
+                    label,
+                    height):
+
+                success = False
+                break
 
     # ========================================================
     # Scan complete
@@ -2017,6 +2231,8 @@ def main(args):
     global APPROACH_HEIGHT
     global ROI_HEIGHT
     global ACTUATOR_HOLD
+    global DIVERSION_HEIGHT
+    global DIVERSION_SPEED
     global PREFER_TF
 
     # anonymous=False on purpose: an anonymous node name would
@@ -2102,6 +2318,16 @@ def main(args):
     ACTUATOR_HOLD = rospy.get_param(
         "~actuator_hold",
         2.0
+    )
+
+    DIVERSION_HEIGHT = rospy.get_param(
+        "~diversion_height",
+        1.0
+    )
+
+    DIVERSION_SPEED = rospy.get_param(
+        "~diversion_speed",
+        0.3
     )
 
     PREFER_TF = rospy.get_param(
