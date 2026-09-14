@@ -112,6 +112,14 @@ d.detect_markers(np.zeros((240, 320, 3), dtype=np.uint8))
 print("ok")
 PY'
 
+# The base image ships without netbase, so /etc/protocols is absent and
+# getprotobyname("tcp") fails. vrpn_client_ros resolves protocols by name and
+# dies on it -- "VRPN connection is not 'doing okay'" on loop, which reads like
+# a network/IP fault and sends you debugging the wrong thing entirely.
+echo "- network name databases"
+expect "getprotobyname works (vrpn needs it)" "6" uav \
+    'python3 -c "import socket; print(socket.getprotobyname(\"tcp\"))"'
+
 echo "- tmux launchers are usable"
 expect "tmux present" "tmux" uav 'command -v tmux'
 # Regression guard: the kill-switch pane must be sent WITHOUT a C-m, or the

@@ -36,6 +36,12 @@
 		<!-- This node will launch the node that bridges vicon (optitrack) and MAVROS -->
 		<include file="$(find qutas_lab_450)/launch/vrpn_optiTrack.launch">
 			<arg name="vrpn_object_name" value="$(arg vrpn_object_name)" />
+			<!-- Without this, vrpn_optiTrack.launch falls back to its own
+			     hardcoded default and vicon_server_dvp (i.e. VICON_SERVER_DVP
+			     from .env) is silently ignored on the OptiTrack path - it was
+			     only ever reaching the vicon group above, which is off by
+			     default. Changing the IP in .env appeared to do nothing. -->
+			<arg name="server" value="$(arg vicon_server_dvp)" />
   		</include>
 	</group>
 

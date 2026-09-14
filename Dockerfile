@@ -15,6 +15,13 @@ ARG USER_GID=$USER_UID
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         git \
+        # /etc/protocols and /etc/services. The ros:noetic-perception base
+        # omits netbase, so getprotobyname("tcp") fails -- which breaks any
+        # library that resolves protocols by name rather than by number.
+        # vrpn_client_ros does, and dies with "vrpn_poll_for_accept:
+        # getprotobyname() failed" then warns "VRPN connection is not
+        # 'doing okay'" forever, no matter what server IP it is given.
+        netbase \
         python3-pip \
         python3-rosdep \
         python3-catkin-tools \
