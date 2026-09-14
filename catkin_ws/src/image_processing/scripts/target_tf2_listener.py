@@ -24,10 +24,21 @@ looks up each one's pose in "map" via TF2, and:
   2. Person/backpack (marker_id == -1) still go through the false-positive
      filter - several consecutive, spatially-consistent sightings (30 cm
      consistency) are required before a target is trusted. Once CONFIRMED,
-     a ONE-SHOT ROI is published on /target_detection/roi (PoseStamped, map
-     frame) for NAV to trigger the descend -> hover -> deploy -> resume
-     diversion. No permanent frame is kept for these - the action happens
-     once and the mission continues.
+     a ONE-SHOT diversion target is published on /target_detection/roi
+     (image_processing/TargetDetectionArray, containing exactly one
+     detection, in map frame) for NAV to trigger the descend -> hover ->
+     deploy -> resume diversion. No permanent frame is kept for these - the
+     action happens once and the mission continues.
+
+     CHANGED: /target_detection/roi used to publish a bare
+     geometry_msgs/PoseStamped - position only, no label. That left NAV
+     with no way to tell a confirmed person apart from a confirmed
+     backpack (each needs a different payload/actuator), so this now
+     publishes the same TargetDetectionArray type used everywhere else in
+     this pipeline, with the confirmed detection's label and confidence
+     carried alongside its resolved position. This is a message-type
+     change for that topic - update any subscriber still expecting
+     PoseStamped.
 
   3. Publishes a running world-frame estimate of everything tracked, on
      /target_detections/world (for the GCS 3D display + voice callout).
@@ -43,7 +54,7 @@ import rospy
 import tf2_ros
 from collections import deque
 from std_msgs.msg import Time
-from geometry_msgs.msg import PoseStamped, TransformStamped
+from geometry_msgs.msg import TransformStamped
 
 from image_processing.msg import TargetDetection, TargetDetectionArray
 
@@ -93,8 +104,10 @@ class TargetWorldEstimator():
         self.buffers = {}       # frame_name -> deque of (x, y, z) in map frame (YOLO only)
         self.confirmed = set()  # frame_names already saved/actioned - never reprocessed
 
+        # TargetDetectionArray (one detection) - see module docstring, point
+        # 2, for why this is no longer a bare PoseStamped.
         self.pub_roi = rospy.Publisher(
-            '/target_detection/roi', PoseStamped, queue_size=10)
+            '/target_detection/roi', TargetDetectionArray, queue_size=10)
         self.pub_world = rospy.Publisher(
             '/target_detections/world', TargetDetectionArray, queue_size=10)
         self.pub_found_time = rospy.Publisher(
@@ -186,7 +199,7 @@ class TargetWorldEstimator():
 
                 # One-shot action target: tell NAV to descend, hover,
                 # deploy payload, then resume - no permanent frame kept.
-                self.send_roi(avg, msg_in.header.stamp)
+                self.send_roi(det, avg, msg_in.header.stamp)
                 self.pub_found_time.publish(msg_in.header.stamp)
                 rospy.loginfo(
                     "Target CONFIRMED, ROI sent for descent/drop: %s "
@@ -209,13 +222,27 @@ class TargetWorldEstimator():
                     return False
         return True
 
-    def send_roi(self, position, stamp):
-        pose = PoseStamped()
-        pose.header.stamp = stamp
-        pose.header.frame_id = MAP_FRAME
-        pose.pose.position.x, pose.pose.position.y, pose.pose.position.z = position
-        pose.pose.orientation.w = 1.0
-        self.pub_roi.publish(pose)
+    def send_roi(self, det, position, stamp):
+        """One-shot confirmed diversion target for NAV.
+
+        Carries the confirmed detection's label and confidence alongside
+        its resolved map-frame position - a bare PoseStamped (the original
+        version of this method) gave NAV no way to tell a confirmed person
+        apart from a confirmed backpack, which matters because each needs
+        a different payload/actuator.
+        """
+        out = TargetDetectionArray()
+        out.header.stamp = stamp
+        out.header.frame_id = MAP_FRAME
+
+        world_det = TargetDetection()
+        world_det.label = det.label
+        world_det.marker_id = det.marker_id
+        world_det.confidence = det.confidence
+        world_det.position.x, world_det.position.y, world_det.position.z = position
+        out.detections.append(world_det)
+
+        self.pub_roi.publish(out)
 
     def broadcast_static_target(self, frame_name, position, stamp):
         # A static transform is latched and held forever by every listener,
