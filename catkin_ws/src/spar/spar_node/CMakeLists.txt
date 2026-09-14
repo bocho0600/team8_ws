@@ -148,6 +148,7 @@ catkin_install_python(PROGRAMS
   scripts/nav_prod_aruco
   scripts/demo
   scripts/demo_ml
+  scripts/demo_div
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
