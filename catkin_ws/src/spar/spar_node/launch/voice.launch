@@ -1,0 +1,15 @@
+<?xml version='1.0'?>
+<launch>
+	<!-- Vocalises mission state transitions and key actions (target
+	     found, payload dropping/deployed) via espeak. Start this before
+	     the mission node so it's already subscribed when the mission
+	     node starts publishing. -->
+	<node name="voice_node" pkg="spar_node" type="voice_node" respawn="true" output="screen">
+		<!-- en-029 = Caribbean English (ISO region code 029), an
+		     espeak-ng-only voice - list English voices with espeak-ng
+		     to confirm it's installed. Classic espeak (no -ng) lacks
+		     this voice entirely; its closest equivalent is en-wi. -->
+		<param name="espeak_voice" type="string" value="en-029" />
+		<param name="espeak_rate" type="int" value="160" />
+	</node>
+</launch>

@@ -40,6 +40,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3-pigpio \
         tmux \
         htop \
+        # Mission vocalisation (voice_node). espeak-ng, NOT plain espeak:
+        # focal only has espeak 1.48, which lacks the en-029 (Caribbean)
+        # voice voice.launch asks for - that variant was added in
+        # espeak-ng. voice_node looks for the `espeak` binary name first,
+        # falling back to `espeak-ng` - espeak-ng's package only installs
+        # the latter, so it always takes that fallback path, which is
+        # expected. pulseaudio-utils gives paplay, which speaks straight
+        # to the host's PulseAudio/PipeWire socket (see docker-compose.yml's
+        # PULSE_SERVER mount) - simpler and more reliable in a container
+        # than getting espeak-ng's own audio backend to find a sound
+        # device at all.
+        espeak-ng \
+        pulseaudio-utils \
     && rm -rf /var/lib/apt/lists/*
 
 # GeographicLib datasets required by mavros for local/global position conversions

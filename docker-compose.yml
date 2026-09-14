@@ -25,6 +25,11 @@ services:
       # only the rviz/rqt GUI panes need it.
       - DISPLAY=${DISPLAY:-}
       - QT_X11_NO_MITSHM=1
+      # Points voice_node's `paplay` at the host's PulseAudio/PipeWire socket
+      # (bind-mounted below), so espeak's audio comes out of whatever the
+      # host has set as its default output - e.g. a connected headset -
+      # instead of needing a sound device inside the container at all.
+      - PULSE_SERVER=unix:/run/user/1000/pulse/native
     volumes:
       # Live-edit source without rebuilding the image; rebuild the image
       # whenever package.xml/CMakeLists dependencies change.
@@ -45,6 +50,11 @@ services:
       # then "No available devices" forever. Bind-mounting the host's real
       # USB tree lets the container follow the re-enumeration.
       - /dev/bus/usb:/dev/bus/usb
+      # Host's PulseAudio/PipeWire socket, for voice_node's espeak/paplay
+      # (see PULSE_SERVER above). :- falls back to the container user's own
+      # runtime dir (uid 1000, matching USER_UID in the Dockerfile) if
+      # XDG_RUNTIME_DIR isn't set in the shell that runs `docker compose up`.
+      - ${XDG_RUNTIME_DIR:-/run/user/1000}/pulse:/run/user/1000/pulse
     # Uncomment on the UAV for the flight controller's serial port. The Pi's
     # GPIO UART is /dev/ttyAMA1, matching control.launch's fcu_url default;
     # a USB-attached FCU shows up as /dev/ttyUSB0 or /dev/ttyACM0 instead.

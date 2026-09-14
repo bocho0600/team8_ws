@@ -149,6 +149,7 @@ catkin_install_python(PROGRAMS
   scripts/demo
   scripts/demo_ml
   scripts/demo_div
+  scripts/voice_node
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

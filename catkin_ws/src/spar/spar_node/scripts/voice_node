@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""Text-to-speech announcer for the UAS mission.
+
+Subscribes to ~topic (std_msgs/String, default /voice/say) and reads each
+message aloud through espeak, one at a time, on a dedicated worker thread -
+so a slow/blocking espeak call never stalls whatever mission node published
+the announcement.
+
+Kept as its own node, rather than each mission script shelling out to
+espeak directly, so:
+  - espeak's blocking subprocess call never runs on a thread that also
+    drives the SPAR action client.
+  - voice tuning (rate/volume/voice) lives in one place.
+  - announcements queue and play in order even if two mission events fire
+    close together, instead of overlapping into noise.
+
+Messages queue if they arrive faster than they can be spoken - there is no
+drop-if-busy or de-duplication. For this mission's rate of state changes
+and diversions, that is an acceptable trade against the complexity of a
+priority/replace scheme.
+
+Audio output: if `paplay` is on PATH (installed alongside espeak - see the
+Dockerfile), each message is rendered by `espeak --stdout` and piped into
+`paplay`, which talks to PulseAudio/PipeWire over $PULSE_SERVER - the route
+that actually works from inside a container (see docker-compose.yml's
+PULSE_SERVER/socket mount), since a container has no ALSA sound device of
+its own to hand to espeak directly. If paplay is missing, not on PATH, or
+fails (no pulse socket - e.g. running directly on the Pi with a speaker
+wired to its own ALSA device), this falls back to calling espeak directly.
+"""
+
+import queue
+import shutil
+import subprocess
+import threading
+
+import rospy
+from std_msgs.msg import String
+
+
+def main():
+
+    rospy.init_node("voice_node")
+
+    topic = rospy.get_param("~topic", "/voice/say")
+    voice = rospy.get_param("~espeak_voice", "en")
+    rate_wpm = rospy.get_param("~espeak_rate", 160)
+    amplitude = rospy.get_param("~espeak_amplitude", 200)
+    enabled = rospy.get_param("~enabled", True)
+
+    espeak_bin = shutil.which("espeak") or shutil.which("espeak-ng")
+    paplay_bin = shutil.which("paplay")
+
+    if espeak_bin is None:
+
+        rospy.logerr(
+            "Neither 'espeak' nor 'espeak-ng' was found on PATH - "
+            "voice_node will log announcements but cannot speak them. "
+            "Install espeak-ng (needed for the en-029 Caribbean voice - "
+            "plain espeak doesn't have it): sudo apt install espeak-ng"
+        )
+
+    say_queue = queue.Queue()
+
+    def speak_via_paplay(text):
+        """espeak renders to a WAV on stdout, paplay plays it over Pulse.
+
+        Returns True on success, False if paplay ran but reported failure
+        (e.g. no reachable PulseAudio/PipeWire server) - both cases
+        deliberately never raise, so the caller can fall back cleanly.
+        """
+
+        espeak_proc = subprocess.Popen(
+            [
+                espeak_bin,
+                "-v", voice,
+                "-s", str(rate_wpm),
+                "-a", str(amplitude),
+                "--stdout",
+                text,
+            ],
+            stdout=subprocess.PIPE,
+        )
+
+        paplay_proc = subprocess.run(
+            [paplay_bin],
+            stdin=espeak_proc.stdout,
+            check=False,
+        )
+
+        espeak_proc.stdout.close()
+        espeak_proc.wait()
+
+        return paplay_proc.returncode == 0
+
+    def speak_direct(text):
+
+        subprocess.run(
+            [
+                espeak_bin,
+                "-v", voice,
+                "-s", str(rate_wpm),
+                "-a", str(amplitude),
+                text,
+            ],
+            check=False,
+        )
+
+    def speak(text):
+
+        rospy.loginfo("Announcing: %s", text)
+
+        if not enabled or espeak_bin is None:
+            return
+
+        if paplay_bin is not None:
+
+            try:
+
+                if speak_via_paplay(text):
+                    return
+
+                rospy.logwarn_throttle(
+                    30,
+                    "paplay playback failed (no reachable PulseAudio/"
+                    "PipeWire server?) - falling back to espeak's own "
+                    "audio output."
+                )
+
+            except OSError as e:
+
+                rospy.logwarn_throttle(
+                    30,
+                    "Could not run espeak/paplay pipeline (%s) - "
+                    "falling back to espeak's own audio output.",
+                    e
+                )
+
+        try:
+            speak_direct(text)
+        except OSError as e:
+            rospy.logerr("Failed to run espeak: %s", e)
+
+    def worker():
+
+        while not rospy.is_shutdown():
+
+            try:
+                text = say_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+
+            if text is None:
+                break
+
+            speak(text)
+            say_queue.task_done()
+
+    worker_thread = threading.Thread(target=worker, daemon=True)
+    worker_thread.start()
+
+    def on_say(msg):
+
+        if not msg.data:
+            return
+
+        say_queue.put(msg.data)
+
+    rospy.Subscriber(topic, String, on_say, queue_size=50)
+
+    rospy.loginfo("voice_node ready - listening on %s", topic)
+
+    rospy.spin()
+
+    say_queue.put(None)
+    worker_thread.join(timeout=2.0)
+
+
+if __name__ == "__main__":
+
+    try:
+        main()
+    except rospy.ROSInterruptException:
+        pass
