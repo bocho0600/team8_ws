@@ -99,7 +99,7 @@ function aruco_frames() {
     echo "--- target frames in TF ---"
     rosrun tf tf_monitor 2>/dev/null | grep -o 'target_[a-z0-9_]*' | sort -u
     echo "--- detections seen (from node log) ---"
-    echo "  check the demo_ml terminal for 'Target frames found during scan'"
+    echo "  check the mission node's terminal for 'Target frames found during scan'"
 }
 
 # --- tmux launcher helpers ---------------------------------------------------
