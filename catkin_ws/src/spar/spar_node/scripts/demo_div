@@ -104,9 +104,22 @@ frame_estimates = {}
 # pass, and it must not divert twice.
 handled_targets = set()
 
-# Diversion targets waiting to be flown to, oldest first. Appended
-# by the detection callback, drained by the scan loop.
+# Raw (unconfirmed) sighting labels, oldest first. Appended by
+# yolo_callback() on every qualifying raw detection - used ONLY to
+# tell send_wp_scan() to cancel the current leg early and stop, so
+# the UAV holds still while IMG's own consistency filter (in
+# target_tf2_listener.py) accumulates enough consistent sightings to
+# confirm. Does NOT by itself trigger an actuator fire - see
+# pending_roi_diversions below for that.
 pending_diversions = []
+
+# CONFIRMED diversions ready to actually fly to and act on: dicts of
+# {"label": str, "position": [x, y, z]}, oldest first. Appended by
+# roi_callback() from /target_detection/roi - target_tf2_listener.py's
+# own 5-consistent-sightings/30cm filter has already resolved these to
+# a trustworthy map-frame position, so handle_diversion() uses this
+# position directly rather than re-resolving it.
+pending_roi_diversions = []
 
 # Queued work for the main thread. One of:
 #   None
@@ -297,16 +310,18 @@ def send_wp(
 
 
 def yolo_callback(msg):
-    """Queue an actuator drop the first time a target label appears,
-    and keep a map-frame position estimate for it.
+    """Note a raw (unconfirmed) sighting so the scan can stop and hold
+    still near it - does NOT resolve a position and does NOT by
+    itself trigger a diversion.
 
-    Now DOES use TF (via _transform_detection_position()), unlike the
-    original version - handle_diversion() flies to this position and
-    descends onto it, rather than dropping wherever the UAV happened
-    to be standing when the label was first seen. A bad camera-mount
-    transform will therefore affect person/backpack drops the same
-    way it already affects ArUco landings - check that transform if
-    drops start missing target.
+    Deliberately back to not touching TF, same as the very first
+    version of this node: the resolved, consistency-filtered position
+    that actually matters now comes from IMG's own pipeline
+    (target_tf2_broadcaster.py + target_tf2_listener.py) via
+    roi_callback() below, once it's confirmed - not from a raw,
+    single-frame sighting here. Firing an actuator off one frame with
+    no consistency check is exactly the false-positive risk that
+    pipeline exists to filter out.
     """
 
     for detection in msg.detections:
@@ -315,15 +330,6 @@ def yolo_callback(msg):
 
         if label not in DIVERSION_ACTUATOR:
             continue
-
-        position = _transform_detection_position(msg.header, detection)
-
-        if position is not None:
-
-            update_frame_estimate(
-                frame_name_for(detection),
-                position
-            )
 
         with state_lock:
 
@@ -336,10 +342,64 @@ def yolo_callback(msg):
             pending_diversions.append(label)
 
             rospy.loginfo(
-                "Diversion QUEUED for '%s' (confidence %.2f).",
+                "Raw sighting of '%s' (confidence %.2f) - holding for "
+                "IMG confirmation.",
                 label,
                 detection.confidence
             )
+
+
+def roi_callback(msg):
+    """Confirmed person/backpack diversion target, ready to act on.
+
+    msg is a TargetDetectionArray containing exactly one detection,
+    published by target_tf2_listener.py's send_roi() once its own
+    5-consistent-sightings/30cm filter has trusted this sighting and
+    resolved it to a map-frame position - see that node's docstring.
+    This is deliberately NOT re-resolved here: handle_diversion() uses
+    msg's position as-is.
+    """
+
+    if not msg.detections:
+        return
+
+    detection = msg.detections[0]
+
+    label = detection.label
+
+    if label not in DIVERSION_ACTUATOR:
+
+        rospy.logwarn(
+            "Confirmed ROI for unrecognised label '%s' - ignoring.",
+            label
+        )
+
+        return
+
+    with state_lock:
+
+        if label in handled_targets:
+            # Already dropped on an earlier pass - target_tf2_listener
+            # guards against re-firing the same std_name too, but this
+            # is a harmless second line of defence.
+            return
+
+        pending_roi_diversions.append({
+            "label": label,
+            "position": [
+                detection.position.x,
+                detection.position.y,
+                detection.position.z
+            ]
+        })
+
+    rospy.loginfo(
+        "CONFIRMED diversion queued for '%s' at map [%.2f, %.2f, %.2f].",
+        label,
+        detection.position.x,
+        detection.position.y,
+        detection.position.z
+    )
 
 
 def has_pending_diversion():
@@ -905,19 +965,56 @@ def detection_callback(msg):
         )
 
 
-def take_pending_diversion():
-    """Pop the next unhandled diversion target, or None."""
+def take_pending_roi_diversion():
+    """Pop the next CONFIRMED, ready-to-act-on diversion, or None.
+
+    Unlike the old take_pending_diversion() (removed - pending_diversions
+    is now only ever bulk-cleared, see send_wps()), entries here already
+    carry a trustworthy map-frame position from target_tf2_listener.py,
+    so there's nothing left to resolve.
+    """
 
     with state_lock:
 
-        while pending_diversions:
+        while pending_roi_diversions:
 
-            frame_name = pending_diversions.pop(0)
+            entry = pending_roi_diversions.pop(0)
 
-            if frame_name in handled_targets:
+            if entry["label"] in handled_targets:
                 continue
 
-            return frame_name
+            return entry
+
+    return None
+
+
+def wait_for_confirmed_diversion(timeout):
+    """Poll for a confirmed diversion for up to timeout seconds.
+
+    Called right after send_wp_scan() stops the UAV early for a raw
+    sighting: stopping was only ever step one - it exists to hold
+    still long enough for target_tf2_listener.py's own filter (5
+    consistent sightings within 30 cm) to confirm the target, which
+    doesn't happen the instant the UAV stops. Without this wait, the
+    segment loop would immediately move on to the next waypoint
+    before that confirmation had any chance to arrive, making the
+    stop pointless.
+
+    Returns the confirmed entry (see take_pending_roi_diversion()),
+    or None if nothing confirmed within timeout.
+    """
+
+    deadline = rospy.Time.now() + rospy.Duration(timeout)
+    poll_period = 0.1
+
+    while not rospy.is_shutdown() and rospy.Time.now() < deadline:
+
+        entry = take_pending_roi_diversion()
+
+        if entry is not None:
+            return entry
+
+        rospy.sleep(poll_period)
 
     return None
 
@@ -1177,53 +1274,32 @@ def log_frame_summary():
 # re-planning, because the UAV itself is done diverting.
 # ============================================================
 
-def handle_diversion(spar_client, srvc_bc, path_pub, actuator_srvs, scan_height, label):
-    """Fly to the detected target, descend to drop height, hold,
-    fire the actuator, then climb back to scan height and resume.
+def handle_diversion(spar_client, srvc_bc, path_pub, actuator_srvs, scan_height, label, position):
+    """Fly to a CONFIRMED target, descend to drop height, hold, fire
+    the actuator, then climb back to scan height and resume.
 
-    Replaces the original "stop and drop in place" behaviour: the
-    target's map-frame position is now resolved (yolo_callback()
-    tracks it the same way ArUco is tracked) and the UAV actually
-    navigates onto it and descends to DROP_HEIGHT, holding for
-    HOVER_BEFORE_DROP seconds before firing - matching B1's "descend
-    to 0.5 m... hover for five seconds to ensure accurate payload
-    deployment" rather than just dropping wherever the scan leg was
-    cancelled.
+    position is a [x, y, z] map-frame point that ALREADY comes
+    resolved and consistency-filtered - see roi_callback() and
+    target_tf2_listener.py's own 5-consistent-sightings/30cm filter.
+    Nothing here re-resolves it (no resolve_frame() call): unlike
+    ArUco, no permanent TF frame is ever kept for a person/backpack,
+    by IMG's own design, so there is nothing further to look up.
 
     State transitions: SEARCH -> DIVERT (entry) -> SEARCH (exit) -
-    same as before, just a longer and more deliberate window in
-    between.
+    covers the whole navigate/descend/hold/fire/climb sequence below,
+    matching B1's "descend to 0.5 m... hover for five seconds to
+    ensure accurate payload deployment" rather than dropping wherever
+    the scan leg happened to be cancelled.
     """
 
     global current_mission_position
 
     set_state(MissionState.DIVERT)
 
-    frame_name = "target_{}".format(label)
-
-    position = resolve_frame(frame_name)
-
-    if position is None:
-
-        # Detected just long enough to queue the diversion, but no
-        # position has resolved yet (TF and detection cache both
-        # empty). Nothing to fly to - bail without marking this
-        # handled, so a better-resolved later sighting can still
-        # trigger a diversion.
-        rospy.logerr(
-            "Diversion for '%s' queued but no position could be "
-            "resolved for frame '%s' - skipping this sighting.",
-            label,
-            frame_name
-        )
-
-        set_state(MissionState.SEARCH)
-
-        return False
-
     rospy.loginfo(
         "================================================"
     )
+
 
     rospy.loginfo(
         "TARGET '%s' detected at map [%.2f, %.2f, %.2f] - diverting.",
@@ -1994,7 +2070,8 @@ def send_wps(
         actuator_srvs,
         scan_height,
         camera_hfov_deg,
-        lane_overlap):
+        lane_overlap,
+        diversion_confirm_timeout):
 
     global current_mission_position
 
@@ -2271,17 +2348,48 @@ def send_wps(
                             actual_end[3]
                         ]
 
-                label = take_pending_diversion()
+                # A raw sighting's only job was to get us stopped
+                # here - clear it now rather than leaving it queued,
+                # or has_pending_diversion() would report a diversion
+                # pending forever with nothing left to consume it.
+                with state_lock:
+                    saw_raw_sighting = bool(pending_diversions)
+                    pending_diversions.clear()
 
-                if label is not None:
+                entry = take_pending_roi_diversion()
 
-                    # The UAV now actually flies to the target and
-                    # descends onto it (see handle_diversion()), so
-                    # the segment below is re-planned from wherever
-                    # that diversion left the UAV - which is back at
-                    # scan height near the target, not the original
-                    # interrupted point. No scan coverage is lost
-                    # either way, since the UAV never skipped ahead.
+                if entry is None and (interrupted or saw_raw_sighting):
+
+                    # We just stopped early (or a sighting arrived
+                    # while already stationary at this point)
+                    # specifically to give target_tf2_listener.py's
+                    # own consistency filter - 5 sightings within
+                    # 30 cm - a chance to confirm this before flying
+                    # on. Wait for it rather than immediately
+                    # continuing to the next path point, or that
+                    # filter never gets the still dwell it needs.
+                    entry = wait_for_confirmed_diversion(
+                        diversion_confirm_timeout
+                    )
+
+                    if entry is None:
+
+                        rospy.logwarn(
+                            "No confirmation arrived within %.1f s of "
+                            "the sighting that stopped this leg - "
+                            "resuming scan without diverting.",
+                            diversion_confirm_timeout
+                        )
+
+                if entry is not None:
+
+                    # The UAV flies to the target and descends onto
+                    # it (see handle_diversion()), so the segment
+                    # below is re-planned from wherever that
+                    # diversion left the UAV - back at scan height
+                    # near the target, not the original stop point.
+                    # No scan coverage is lost either way, since the
+                    # UAV never skipped ahead.
                     #
                     # handle_diversion() itself sets DIVERT on entry
                     # and SEARCH on exit - the mission is back in
@@ -2293,7 +2401,8 @@ def send_wps(
                         path_pub,
                         actuator_srvs,
                         scan_height,
-                        label
+                        entry["label"],
+                        entry["position"]
                     )
 
                     diverted = True
@@ -2327,20 +2436,46 @@ def send_wps(
         )
 
     # ========================================================
-    # Drain anything detected on the final leg
+    # Drain anything confirmed right at the tail of the scan
     # ========================================================
 
     if success:
 
+        with state_lock:
+            saw_raw_sighting = bool(pending_diversions)
+            pending_diversions.clear()
+
+        if saw_raw_sighting:
+
+            rospy.loginfo(
+                "Sighting pending at end of scan - waiting up to "
+                "%.1f s for confirmation.",
+                diversion_confirm_timeout
+            )
+
+            entry = wait_for_confirmed_diversion(diversion_confirm_timeout)
+
+            if entry is not None:
+
+                handle_diversion(
+                    spar_client,
+                    srvc_bc,
+                    path_pub,
+                    actuator_srvs,
+                    scan_height,
+                    entry["label"],
+                    entry["position"]
+                )
+
         while not rospy.is_shutdown():
 
-            label = take_pending_diversion()
+            entry = take_pending_roi_diversion()
 
-            if label is None:
+            if entry is None:
                 break
 
             rospy.loginfo(
-                "Handling target queued during the final leg."
+                "Handling diversion confirmed at end of scan."
             )
 
             handle_diversion(
@@ -2349,7 +2484,8 @@ def send_wps(
                 path_pub,
                 actuator_srvs,
                 scan_height,
-                label
+                entry["label"],
+                entry["position"]
             )
 
     # ========================================================
@@ -2476,6 +2612,11 @@ def main(args):
         "/target_detections/yolo"
     )
 
+    roi_topic = rospy.get_param(
+        "~roi_topic",
+        "/target_detection/roi"
+    )
+
     mission_state_topic = rospy.get_param(
         "~mission_state_topic",
         "/mission_state"
@@ -2546,6 +2687,15 @@ def main(args):
     LANE_OVERLAP = rospy.get_param(
         "~lane_overlap",
         0.0
+    )
+
+    # How long to wait, after stopping for a raw sighting, for IMG's
+    # own consistency filter (target_tf2_listener.py: 5 sightings
+    # within 30 cm) to actually confirm it before giving up and
+    # resuming the scan.
+    DIVERSION_CONFIRM_TIMEOUT = rospy.get_param(
+        "~diversion_confirm_timeout",
+        4.0
     )
 
     APPROACH_HEIGHT = rospy.get_param(
@@ -2680,13 +2830,19 @@ def main(args):
     # --------------------------------------------------------
     # Detections
     #
-    # Two separate callbacks:
+    # Three subscriptions, two different jobs:
     #   ArUco -> detection_callback, which transforms into the map
     #            frame and averages, because landing needs a
     #            position the UAV can navigate to later.
-    #   YOLO  -> yolo_callback, which only reads the label. The drop
-    #            happens where the UAV is standing, so no TF is
-    #            involved at all.
+    #   YOLO  -> yolo_callback, a RAW/unconfirmed feed used only to
+    #            tell send_wp_scan() to stop early and hold near a
+    #            sighting - it resolves no position and triggers no
+    #            actuator by itself.
+    #   ROI   -> roi_callback, the CONFIRMED feed. IMG's own
+    #            consistency filter (target_tf2_listener.py) is what
+    #            actually decides a person/backpack sighting is
+    #            trustworthy and resolves its map-frame position;
+    #            this is the one that leads to an actuator firing.
     # --------------------------------------------------------
 
     rospy.Subscriber(
@@ -2703,14 +2859,26 @@ def main(args):
         queue_size=10
     )
 
+    rospy.Subscriber(
+        roi_topic,
+        TargetDetectionArray,
+        roi_callback,
+        queue_size=10
+    )
+
     rospy.loginfo(
         "ArUco detections (map-frame, for landing): %s",
         aruco_topic
     )
 
     rospy.loginfo(
-        "YOLO detections (label only, drop in place): %s",
+        "YOLO detections (raw, hold-for-confirmation only): %s",
         yolo_topic
+    )
+
+    rospy.loginfo(
+        "Confirmed ROI diversions (map-frame, from IMG): %s",
+        roi_topic
     )
 
     rospy.loginfo(
@@ -2770,7 +2938,8 @@ def main(args):
         actuator_srvs,
         SCAN_HEIGHT,
         CAMERA_HFOV_DEG,
-        LANE_OVERLAP
+        LANE_OVERLAP,
+        DIVERSION_CONFIRM_TIMEOUT
     )
 
     if not success:

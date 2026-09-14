@@ -199,6 +199,7 @@ catkin_install_python(PROGRAMS
   scripts/tf2_broadcaster_frames.py
   scripts/target_tf2_broadcaster.py
   scripts/target_tf2_listener.py
+  scripts/fake_pub.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

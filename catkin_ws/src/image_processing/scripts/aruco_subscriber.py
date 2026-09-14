@@ -36,6 +36,17 @@ class ArucoDetector():
         # so it can be tuned without touching code if the printed size changes.
         self.marker_length = rospy.get_param('~marker_length', 0.2)
 
+        # The actual TF frame these detections are in. MUST match camera_name
+        # in tf2_broadcaster_frames.py (default "camera") and
+        # dai_publisher_yolov11_runner.py's own ~camera_frame_id - keep all
+        # three in sync. This used to NOT exist: publish_detections() below
+        # inherited the incoming image's header verbatim, which carries
+        # frame_id "home" (see dai_publisher_yolov11_runner.py's
+        # publish_to_ros()) - a frame that is very unlikely to be rigidly
+        # attached to the camera, so every ArUco position was being resolved
+        # against the wrong parent frame rather than failing loudly.
+        self.camera_frame_id = rospy.get_param('~camera_frame_id', 'camera')
+
         # Publisher: annotated image (for viewing in rqt/Rviz)
         # queue_size=1: live video, so a backlog is never worth keeping -
         # matching the queue_size=1 on the subscriber below for the same reason.
@@ -70,6 +81,9 @@ class ArucoDetector():
         self.cam_info_sub = rospy.Subscriber(
             self.cam_info_topic, CameraInfo, self.cam_info_callback,
             queue_size=1)
+
+        rospy.loginfo("ArUco detections will be stamped with TF frame: {}".format(
+            self.camera_frame_id))
 
         if not rospy.is_shutdown():
             # queue_size=1 + a large buff_size means "always process the
@@ -202,7 +216,16 @@ class ArucoDetector():
 
     def publish_detections(self, detections, header):
         msg_out = TargetDetectionArray()
-        msg_out.header = header
+        # Was `msg_out.header = header` - this blindly inherited the source
+        # image's header, INCLUDING its frame_id ("home" - see
+        # dai_publisher_yolov11_runner.py's publish_to_ros()), which is not
+        # a frame rigidly attached to the camera. The timestamp is still
+        # copied (needed to look up the UAV's pose in TF at the moment the
+        # frame was captured), but frame_id is now stamped explicitly with
+        # the real camera TF frame instead of inherited.
+        msg_out.header.stamp = header.stamp
+        msg_out.header.seq = header.seq
+        msg_out.header.frame_id = self.camera_frame_id
         msg_out.detections = detections
 
         self.detection_pub.publish(msg_out)

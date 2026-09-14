@@ -76,6 +76,17 @@ class DepthaiCamera():
         if "input_size" in nnConfig:
             self.nn_shape_w, self.nn_shape_h = tuple(map(int, nnConfig.get("input_size").split('x')))
 
+        # The actual TF frame this camera's data lives in. MUST match
+        # camera_name in tf2_broadcaster_frames.py (default "camera") -
+        # this used to be hardcoded as the literal "camera_frame" below,
+        # which is not a frame that exists anywhere in TF, so every
+        # detection/camera_info message claimed to be in a frame nothing
+        # could ever resolve. Exposed as a param (rather than fixed to
+        # "camera") so it stays correct if the static transform's child
+        # frame name is ever changed via tf2_broadcaster_frames.py's own
+        # ~camera_frame param - keep the two in sync.
+        self.camera_frame_id = rospy.get_param('~camera_frame_id', 'camera')
+
         self.pub_image = rospy.Publisher(self.pub_topic, CompressedImage, queue_size=10)
         self.pub_image_detect = rospy.Publisher(self.pub_topic_detect, CompressedImage, queue_size=10)
         self.pub_cam_inf = rospy.Publisher(self.pub_topic_cam_inf, CameraInfo, queue_size=10)
@@ -90,6 +101,7 @@ class DepthaiCamera():
         self.timer = rospy.Timer(rospy.Duration(1.0 / 10), self.publish_camera_info, oneshot=False)
 
         rospy.loginfo("Publishing images to rostopic: {}".format(self.pub_topic))
+        rospy.loginfo("Camera TF frame: {}".format(self.camera_frame_id))
 
         rospy.on_shutdown(lambda: self.shutdown())
 
@@ -118,7 +130,9 @@ class DepthaiCamera():
             return
 
         camera_info_msg = CameraInfo()
-        camera_info_msg.header.frame_id = "camera_frame"
+        # Was hardcoded "camera_frame" - see self.camera_frame_id comment
+        # above for why that never resolved in TF.
+        camera_info_msg.header.frame_id = self.camera_frame_id
         camera_info_msg.height = self.nn_shape_h
         camera_info_msg.width = self.nn_shape_w
 
@@ -220,6 +234,16 @@ class DepthaiCamera():
     def publish_to_ros(self, jpeg_bytes):
         # jpeg_bytes comes pre-encoded from the on-device VideoEncoder -
         # no cv2.imencode here, this is just message construction.
+        #
+        # frame_id is deliberately left as "home", NOT self.camera_frame_id:
+        # this is a display-only stream (rqt/GCS video feed), and
+        # aruco_subscriber.py used to inherit THIS header verbatim for its
+        # own published detections - which is how "home" ended up on ArUco
+        # detections too. aruco_subscriber.py has been fixed to stamp its
+        # own frame_id explicitly instead of inheriting this one, so this
+        # "home" label no longer leaks into anything TF cares about. Left
+        # alone here since nothing about the video message itself feeds a
+        # transform.
         msg_out = CompressedImage()
         msg_out.header.stamp = rospy.Time.now()
         msg_out.format = "jpeg"
@@ -238,7 +262,9 @@ class DepthaiCamera():
     def publish_targets(self, detections):
         msg_out = TargetDetectionArray()
         msg_out.header.stamp = rospy.Time.now()
-        msg_out.header.frame_id = "camera_frame"
+        # Was hardcoded "camera_frame" - see self.camera_frame_id comment
+        # in __init__ for why that never resolved in TF.
+        msg_out.header.frame_id = self.camera_frame_id
 
         for detection in detections:
             target = TargetDetection()
