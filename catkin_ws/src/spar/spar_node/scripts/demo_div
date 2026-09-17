@@ -1721,6 +1721,7 @@ def send_wps(
     camera_hfov_deg,
     lane_overlap,
     diversion_confirm_timeout,
+    max_unconfirmed_stall_retries,
 ):
 
     global current_mission_position
@@ -1803,9 +1804,20 @@ def send_wps(
 
         segment_done = False
 
+        # Counts consecutive unconfirmed stops (raw sighting stopped
+        # the leg early, but nothing ever confirmed) on THIS segment -
+        # see the stall-retry handling below. Reset per segment so a
+        # flaky detection on one lane doesn't eat into another lane's
+        # retry budget.
+        segment_stall_retries = 0
+
         # ----------------------------------------------------
-        # Re-planning loop for this segment. Runs more than
-        # once only if a diversion interrupted it.
+        # Re-planning loop for this segment. Runs more than once
+        # only if a diversion interrupted it, or if a raw sighting
+        # stopped the leg early and never got confirmed (see the
+        # stall-retry handling below) - either way the UAV re-plans
+        # from wherever it actually stopped rather than skipping
+        # ahead to the next segment.
         # ----------------------------------------------------
 
         while not segment_done and not rospy.is_shutdown():
@@ -1963,6 +1975,45 @@ def send_wps(
                             "resuming scan without diverting.",
                             diversion_confirm_timeout,
                         )
+
+                        if interrupted:
+
+                            # send_wp_scan() cancelled the goal before
+                            # (x, y, z) was actually reached - current_
+                            # mission_position above is only the closest
+                            # available estimate, not proof of arrival.
+                            # If we just carried on to the next path
+                            # point (or ended the segment here), the
+                            # un-flown gap between wherever we really
+                            # stopped and (x, y, z) would be silently
+                            # skipped - exactly the missed-coverage bug
+                            # unstable in-flight detections were causing
+                            # on real hardware. Break out and let the
+                            # segment re-planning loop above retry this
+                            # same requested_end from here, the same way
+                            # it already does after a genuine diversion.
+                            segment_stall_retries += 1
+
+                            if segment_stall_retries <= max_unconfirmed_stall_retries:
+
+                                rospy.logwarn(
+                                    "Point not actually reached - "
+                                    "resuming this leg from the stop "
+                                    "point instead of skipping ahead "
+                                    "(retry %d/%d).",
+                                    segment_stall_retries,
+                                    max_unconfirmed_stall_retries,
+                                )
+
+                                diverted = True
+                                break
+
+                            rospy.logwarn(
+                                "Stopped %d times on unconfirmed "
+                                "sightings for this leg - giving up on "
+                                "the hold and continuing the pattern.",
+                                segment_stall_retries,
+                            )
 
                 if entry is not None:
 
@@ -2206,6 +2257,14 @@ def main(args):
     # resuming the scan.
     DIVERSION_CONFIRM_TIMEOUT = rospy.get_param("~diversion_confirm_timeout", 4.0)
 
+    # A raw sighting that never confirms stops the UAV mid-leg without
+    # ever reaching the requested point - see the stall-retry handling
+    # in send_wps(). This caps how many times in a row that's allowed
+    # to happen on the same leg before giving up on the hold and
+    # continuing the pattern anyway, so a persistently flickering
+    # false positive can't stall the mission forever.
+    MAX_UNCONFIRMED_STALL_RETRIES = rospy.get_param("~max_unconfirmed_stall_retries", 3)
+
     ROI_HEIGHT = rospy.get_param("~roi_height", 1.5)
 
     DROP_HEIGHT = rospy.get_param("~drop_height", 0.5)
@@ -2365,6 +2424,7 @@ def main(args):
         CAMERA_HFOV_DEG,
         LANE_OVERLAP,
         DIVERSION_CONFIRM_TIMEOUT,
+        MAX_UNCONFIRMED_STALL_RETRIES,
     )
 
     if not success:
