@@ -26,10 +26,21 @@ syncNN = True
 # Camera runs at full rate; detection only runs on every Nth frame to save
 # compute/power. Video output stays decoupled from detection cadence and is
 # encoded on-device (VideoEncoder) so the Pi never touches raw video pixels.
-CAM_FPS = 30
-DETECT_EVERY_N = 3
-JPEG_QUALITY = 60          # used for the detection-overlay stream only;
-                           # the main video stream is hardware MJPEG-encoded
+# 15 rather than 30: in the 2026-09-28 flight bag the Pi only ever delivered
+# ~15 Hz of 720p video (ArUco kept up with <2 Hz), so the extra frames were
+# pulled over USB and handled in Python only to be dropped, stealing CPU from
+# everything else. DETECT_EVERY_N=2 keeps YOLO at ~7.5 Hz nominal.
+CAM_FPS = 15
+DETECT_EVERY_N = 2
+JPEG_QUALITY = 60          # used for both the detection-overlay stream
+                           # and the hardware-MJPEG main video stream
+
+# Main video stream resolution. This is what ArUco detection runs on (on the
+# Pi), and the published camera_info intrinsics are computed for exactly this
+# size. The NN keeps its own square nn_shape_w x nn_shape_h preview - YOLO's
+# spatial detections take position from stereo depth, not camera_info.
+# 1280x720 is the full 1080p ISP image scaled by 2/3 (see setIspScale), so it
+# keeps the full 16:9 field of view rather than a centre crop.
 VIDEO_WIDTH, VIDEO_HEIGHT = 1280, 720
 
 # model path - update these to match your converted YOLOv11 blob folder
@@ -109,8 +120,10 @@ class DepthaiCamera():
         """Read the OAK-D's real factory calibration instead of using hardcoded values."""
         calibData = device.readCalibration()
 
+        # Intrinsics for the main video stream (what ArUco runs on), not the
+        # NN preview - camera_info must describe the image it's paired with.
         intrinsics = calibData.getCameraIntrinsics(
-            dai.CameraBoardSocket.CAM_A, self.nn_shape_w, self.nn_shape_h)
+            dai.CameraBoardSocket.CAM_A, VIDEO_WIDTH, VIDEO_HEIGHT)
         self.camera_matrix = [v for row in intrinsics for v in row]  # flatten 3x3 -> 9
 
         self.dist_coeffs = calibData.getDistortionCoefficients(dai.CameraBoardSocket.CAM_A)
@@ -133,8 +146,8 @@ class DepthaiCamera():
         # Was hardcoded "camera_frame" - see self.camera_frame_id comment
         # above for why that never resolved in TF.
         camera_info_msg.header.frame_id = self.camera_frame_id
-        camera_info_msg.height = self.nn_shape_h
-        camera_info_msg.width = self.nn_shape_w
+        camera_info_msg.height = VIDEO_HEIGHT
+        camera_info_msg.width = VIDEO_WIDTH
 
         camera_info_msg.K = self.camera_matrix
         camera_info_msg.D = list(self.dist_coeffs)
@@ -313,7 +326,7 @@ class DepthaiCamera():
         detection_nn.setAnchorMasks(anchorMasks)
         detection_nn.setIouThreshold(iouThreshold)
         detection_nn.setBlobPath(nnPath)
-        # Bumped from 2 -> 4: at CAM_FPS=30 with detection now only running on
+        # Bumped from 2 -> 4: with detection only running on
         # a subset of frames, a small pool could stall the NN waiting for a
         # buffer to free between inference runs.
         detection_nn.setNumPoolFrames(4)
@@ -330,6 +343,9 @@ class DepthaiCamera():
         cam.setInterleaved(False)
         cam.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
         cam.setFps(CAM_FPS)
+        # Scale the 1920x1080 ISP output down to 1280x720 so the video is the
+        # full field of view. setVideoSize alone would centre-crop instead.
+        cam.setIspScale(2, 3)
         cam.setVideoSize(VIDEO_WIDTH, VIDEO_HEIGHT)
 
         # Script node gates which frames reach the NN, decoupling video fps
@@ -353,11 +369,14 @@ while True:
 
         # Video is encoded to MJPEG on-device via VideoEncoder, so the Pi's
         # CPU never runs cv2.imencode on the main video stream - it just
-        # relays already-compressed bytes. Uses cam.video (full VIDEO_WIDTH x
-        # VIDEO_HEIGHT), independent of the small NN preview and its
-        # detection decimation.
+        # relays already-compressed bytes. Uses cam.video (VIDEO_WIDTH x
+        # VIDEO_HEIGHT, already NV12 so it feeds the encoder directly),
+        # independent of the small NN preview and its detection decimation.
+        # camera_info intrinsics are computed for this same size - see
+        # read_calibration().
         videoEnc = pipeline.create(dai.node.VideoEncoder)
         videoEnc.setDefaultProfilePreset(CAM_FPS, dai.VideoEncoderProperties.Profile.MJPEG)
+        videoEnc.setQuality(JPEG_QUALITY)
         cam.video.link(videoEnc.input)
 
         xout_video = pipeline.create(dai.node.XLinkOut)

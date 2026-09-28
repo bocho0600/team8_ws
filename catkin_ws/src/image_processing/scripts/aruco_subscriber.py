@@ -53,6 +53,15 @@ class ArucoDetector():
         self.aruco_pub = rospy.Publisher(
             '/processed_aruco/image/compressed', CompressedImage, queue_size=1)
 
+        # The annotated stream is for display only (GCS Rviz, the Pi's bag),
+        # so it is published smaller and slower than detection runs: drawing,
+        # colour decode and JPEG encode of every full-res frame was a large
+        # share of this node's CPU on the Pi. Detection itself still runs on
+        # every full-resolution frame.
+        self.viz_width = rospy.get_param('~viz_width', 640)
+        self.viz_period = 1.0 / rospy.get_param('~viz_rate', 5.0)
+        self.last_viz_time = 0.0
+
         # Publisher: structured detections (label, id, confidence, 3D position)
         # consumed by NAV for landing-marker selection / waypoint storage.
         self.detection_pub = rospy.Publisher(
@@ -72,6 +81,19 @@ class ArucoDetector():
         # until the first CameraInfo message arrives.
         self.camera_matrix = None
         self.dist_coeffs = None
+        # (width, height) the intrinsics above were computed for.
+        self.cam_info_size = None
+
+        # Marker corners in the marker's own frame, in the order detectMarkers
+        # returns them (TL, TR, BR, BL). Z=0 since the marker is flat. Fixed
+        # for the node's lifetime, so built once rather than per detection.
+        half = self.marker_length / 2.0
+        self.marker_obj_points = np.array([
+            [-half,  half, 0],
+            [ half,  half, 0],
+            [ half, -half, 0],
+            [-half, -half, 0]
+        ], dtype=np.float32)
 
         # Keep the latest known position for each marker ID seen. Useful if
         # NAV wants a "best known" landing-marker position rather than only
@@ -104,6 +126,7 @@ class ArucoDetector():
         # K is the 3x3 intrinsic matrix, row-major, from sensor_msgs/CameraInfo
         self.camera_matrix = np.array(msg_in.K, dtype=np.float64).reshape((3, 3))
         self.dist_coeffs = np.array(msg_in.D, dtype=np.float64)
+        self.cam_info_size = (msg_in.width, msg_in.height)
 
     def img_callback(self, msg_in):
         if self.camera_matrix is None:
@@ -111,15 +134,48 @@ class ArucoDetector():
             rospy.logwarn_throttle(5, "Waiting for camera_info before running ArUco detection...")
             return
 
-        try:
-            frame = self.br.compressed_imgmsg_to_cv2(msg_in)
-        except CvBridgeError as e:
-            rospy.logerr(e)
+        # The annotated stream is only for humans in rqt/Rviz. When nobody is
+        # subscribed, or it was published less than viz_period ago, skip the
+        # colour decode, the drawing and the JPEG re-encode - together these
+        # cost more than detection itself. Detection only needs grayscale
+        # (detectMarkers converts to gray internally anyway), and libjpeg
+        # decodes grayscale noticeably faster because it can skip chroma
+        # upsampling/colour conversion.
+        now = rospy.get_time()
+        annotate = (self.aruco_pub.get_num_connections() > 0
+                    and now - self.last_viz_time >= self.viz_period)
+        if annotate:
+            self.last_viz_time = now
+
+        if annotate:
+            try:
+                frame = self.br.compressed_imgmsg_to_cv2(msg_in)
+            except CvBridgeError as e:
+                rospy.logerr(e)
+                return
+        else:
+            frame = cv2.imdecode(np.frombuffer(msg_in.data, np.uint8),
+                                 cv2.IMREAD_GRAYSCALE)
+            if frame is None:
+                rospy.logerr("Failed to decode compressed image")
+                return
+
+        # Intrinsics only hold for the image size they were computed for. A
+        # mismatch (e.g. the video stream resized without updating
+        # camera_info) gives confidently wrong positions rather than an
+        # error, so refuse to publish poses until the two agree.
+        frame_size = (frame.shape[1], frame.shape[0])
+        if frame_size != self.cam_info_size:
+            rospy.logerr_throttle(
+                5, "Image size %dx%d does not match camera_info %dx%d - "
+                "skipping ArUco detection, poses would be wrong"
+                % (frame_size + self.cam_info_size))
             return
 
-        aruco_frame, detections = self.find_aruco(frame)
+        aruco_frame, detections = self.find_aruco(frame, annotate)
 
-        self.publish_to_ros(aruco_frame)
+        if annotate:
+            self.publish_to_ros(aruco_frame)
         self.publish_detections(detections, msg_in.header)
 
     def estimate_pose(self, marker_corner):
@@ -131,21 +187,14 @@ class ArucoDetector():
         just not dependent on a function that may or may not exist depending on
         whose machine this runs on.
         """
-        half = self.marker_length / 2.0
-        # Object points in the marker's own frame: top-left, top-right,
-        # bottom-right, bottom-left - matching the corner order detectMarkers
-        # returns. Z=0 since the marker is flat.
-        obj_points = np.array([
-            [-half,  half, 0],
-            [ half,  half, 0],
-            [ half, -half, 0],
-            [-half, -half, 0]
-        ], dtype=np.float32)
-
         img_points = marker_corner.reshape((4, 2)).astype(np.float32)
 
+        # IPPE_SQUARE is the solver purpose-built for exactly this case (4
+        # coplanar points of a square in this corner order): analytic, so
+        # faster than the default iterative LM solve, and more accurate.
         success, rvec, tvec = cv2.solvePnP(
-            obj_points, img_points, self.camera_matrix, self.dist_coeffs)
+            self.marker_obj_points, img_points, self.camera_matrix,
+            self.dist_coeffs, flags=cv2.SOLVEPNP_IPPE_SQUARE)
 
         return rvec, tvec
 
@@ -156,7 +205,7 @@ class ArucoDetector():
         return cv2.aruco.detectMarkers(
             frame, self.aruco_dict, parameters=self.aruco_params)
 
-    def find_aruco(self, frame):
+    def find_aruco(self, frame, annotate=True):
         detections = []
 
         (corners, ids, _) = self.detect_markers(frame)
@@ -171,24 +220,33 @@ class ArucoDetector():
                 # Marker length now correctly matches the printed 200mm markers
                 rvec, tvec = self.estimate_pose(marker_corner)
 
-                cv2.polylines(frame, [corners_reshaped], isClosed=True, color=(0, 255, 0), thickness=2)
-                cv2.drawFrameAxes(frame, self.camera_matrix, self.dist_coeffs, rvec, tvec, 0.1)
+                if annotate:
+                    # Drawn at full resolution, then the whole frame is shrunk
+                    # to viz_width in publish_to_ros(), so line widths, text
+                    # sizes and offsets are scaled up by the same factor to
+                    # stay readable after the downscale.
+                    s = max(1.0, frame.shape[1] / float(self.viz_width))
+                    thick = max(1, int(round(2 * s)))
+                    cv2.polylines(frame, [corners_reshaped], isClosed=True, color=(0, 255, 0), thickness=thick)
+                    cv2.drawFrameAxes(frame, self.camera_matrix, self.dist_coeffs, rvec, tvec, 0.1)
 
-                cv2.putText(frame, str(marker_ID), (top_left[0], top_left[1] - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                    cv2.putText(frame, str(marker_ID), (top_left[0], top_left[1] - int(10 * s)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5 * s, (0, 255, 0), thick)
 
-                center_x = int(np.mean(corners_reshaped[:, 0]))
-                center_y = int(np.mean(corners_reshaped[:, 1]))
+                    center_x = int(np.mean(corners_reshaped[:, 0]))
+                    center_y = int(np.mean(corners_reshaped[:, 1]))
+                    center_text = f"({center_x}, {center_y})"
+                    cv2.putText(frame, center_text, (top_left[0], top_left[1] - int(30 * s)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5 * s, (0, 0, 255), thick)
 
                 # tvec is the marker's position in the camera's optical frame, in metres
                 tvec = tvec.flatten()
-                rospy.loginfo(
-                    "AruCo Marker Detected, ID: %d, Position (m): x=%.2f y=%.2f z=%.2f",
-                    int(marker_ID), tvec[0], tvec[1], tvec[2])
-
-                center_text = f"({center_x}, {center_y})"
-                cv2.putText(frame, center_text, (top_left[0], top_left[1] - 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                # Throttled: at 30 fps an unthrottled loginfo per marker per
+                # frame floods stdout and /rosout. The full stream is on
+                # /target_detections/aruco for anything that needs it.
+                rospy.loginfo_throttle(
+                    1, "AruCo Marker Detected, ID: %d, Position (m): x=%.2f y=%.2f z=%.2f"
+                    % (int(marker_ID), tvec[0], tvec[1], tvec[2]))
 
                 detection = TargetDetection()
                 detection.label = "aruco"
@@ -202,6 +260,13 @@ class ArucoDetector():
         return frame, detections
 
     def publish_to_ros(self, frame):
+        # Display-only, so shrink before encoding: at 640 wide the JPEG
+        # encode and the message are roughly a quarter of full 720p.
+        # INTER_AREA is the right filter for downscaling (no aliasing).
+        if frame.shape[1] > self.viz_width:
+            h = int(round(frame.shape[0] * self.viz_width / float(frame.shape[1])))
+            frame = cv2.resize(frame, (self.viz_width, h), interpolation=cv2.INTER_AREA)
+
         msg_out = CompressedImage()
         msg_out.header.stamp = rospy.Time.now()
         msg_out.format = "jpeg"
