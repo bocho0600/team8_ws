@@ -19,8 +19,8 @@
 
 	<!-- MAVROS Node -->
 	<include file="$(find mavros)/launch/node.launch">
-		<arg name="pluginlists_yaml" value="/home/uavteam8/catkin_ws/launch/px4_pluginlists.yaml" />
-		<arg name="config_yaml" value="/home/uavteam8/catkin_ws/launch/px4_config.yaml" />
+    <arg name="pluginlists_yaml" value="/home/team8_ws/uavteam8/catkin_ws/launch/px4_pluginlists.yaml" />
+    <arg name="config_yaml" value="/home/team8_ws/uavteam8/catkin_ws/launch/px4_config.yaml" />
 
 		<arg name="fcu_url" value="$(arg fcu_url)" />
 		<arg name="gcs_url" value="$(arg gcs_url)" />
