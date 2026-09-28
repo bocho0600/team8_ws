@@ -146,7 +146,7 @@ function gcs_tmux_standalone() {
     _pane_cmd "${panes[3]}" 3 "roslaunch $CATKIN_WS/launch/combined_nodes.launch"
 
     tmux send-keys -t "${panes[4]}" C-l
-    _pane_cmd "${panes[4]}" 3 "roslaunch spar_node voice.launch"
+    _pane_cmd "${panes[4]}" 3 "roslaunch vocalisation voice.launch"
 
     tmux send-keys -t "${panes[5]}" C-l
     _pane_cmd "${panes[5]}" 3 "rviz -d $CATKIN_WS/src/image_processing/rviz/gcs_rviz.rviz"
