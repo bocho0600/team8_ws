@@ -21,9 +21,120 @@ from spar_node.srv import FrameTarget, FrameTargetResponse
 from nav_msgs.msg import Path
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
+from sensor_msgs.msg import CameraInfo
 from geometry_msgs.msg import PoseStamped, Point, PointStamped
 
 from image_processing.msg import TargetDetectionArray
+
+# ============================================================
+# Tunable parameters
+#
+# Everything you might want to change between flights is here.
+# Any of them can also be overridden at launch without editing
+# this file, as a private param with the same name in lower case:
+#
+#     rosrun spar_node demo_div _scan_height:=2.5 _speed:=0.4
+#
+# (load_params() applies those overrides at startup.)
+# ============================================================
+
+# ---- Search area (map frame, metres) -----------------------
+# The lawnmower scan covers this whole rectangle.
+SEARCH_X_MIN = -2.5
+SEARCH_X_MAX = 2.5
+SEARCH_Y_MIN = -2.5
+SEARCH_Y_MAX = 2.5
+
+# ---- Heights (metres) --------------------------------------
+# SCAN_HEIGHT is also the altitude every transit to a target is
+# flown at. HLO-M-1 allows 1.5-4.0 m; decided per team on the day.
+SCAN_HEIGHT = 2.0
+ROI_HEIGHT = 1.5    # /aruco/roi: descend to here over the marker and hold
+DROP_HEIGHT = 0.5   # descend to here over a person/backpack before dropping (B1)
+
+# ---- Speeds (m/s) and accuracy -----------------------------
+SPEED = 0.5          # every waypoint - scan legs, transits and diversions
+TAKEOFF_SPEED = 0.5
+LANDING_SPEED = 0.2
+ACCURACY = 0.1       # how close counts as "reached" (m, and rad for yaw)
+
+# Looser "reached" tolerance for scan waypoints only. Every waypoint
+# is a full stop, and settling to 10 cm at each lane corner is slow
+# for no benefit - the lanes overlap by far more than this. Diversions,
+# transits, take-off and landing still use ACCURACY.
+SCAN_ACCURACY = 0.25
+
+# Take off before scanning. False = assume the UAV is already
+# airborne at the first scan waypoint (e.g. `rosrun spar_node takeoff`).
+DO_TAKEOFF = True
+
+# ---- Timings (seconds) -------------------------------------
+HOVER_BEFORE_DROP = 5.0    # hold at DROP_HEIGHT before firing (B1)
+ACTUATOR_HOLD = 2.0        # hold after firing, before climbing back
+WAYPOINT_SETTLE = 2.0      # pause after arriving over a target / ROI point
+# Extra hover at the end of each scan segment. 0 because the UAV
+# already stops and settles at every waypoint (see SCAN_ACCURACY).
+SEGMENT_END_PAUSE = 0.0
+
+# After a raw YOLO sighting stops the UAV, how long to hold for
+# target_tf2_listener.py (5 sightings within 30 cm) to confirm it.
+DIVERSION_CONFIRM_TIMEOUT = 4.0
+
+# How many times in a row one scan leg may be stopped by sightings
+# that never confirm. After that the rest of the leg is flown
+# without stopping for sightings, so a flickering false positive
+# can't stall the mission forever (or cut the leg short).
+MAX_UNCONFIRMED_STALL_RETRIES = 3
+
+# ---- Scan coverage -----------------------------------------
+# Lane spacing is set from the field of view of the image YOLO
+# actually sees - the square 640x640 NN input, a centre crop of the
+# 16:9 video - NOT the camera's full 69 deg HFOV. Spacing lanes for
+# the full width left strips between passes YOLO never saw.
+#
+# At startup this is measured from camera_info (see
+# detection_hfov_from_camera_info()); this value is only the
+# fallback if camera_info isn't available: 69 deg across the 16:9
+# width, cropped to a square -> 2*atan(9/16 * tan(69/2)) = 42 deg.
+# Setting _detection_hfov_deg at launch overrides both.
+DETECTION_HFOV_DEG = 42.0
+
+# Fraction of each pass's footprint that overlaps the next pass.
+# 0.0 = edges just touch, which any position/yaw error turns into
+# a gap, so keep some margin.
+LANE_OVERLAP = 0.2
+
+# ---- Blocked waypoints -------------------------------------
+# If Breadcrumb can't reach a waypoint, try points around it in
+# FALLBACK_STEP rings out to FALLBACK_MAX_RADIUS (metres).
+FALLBACK_STEP = 0.25
+FALLBACK_MAX_RADIUS = 1.0
+
+# ---- ArUco landing position --------------------------------
+# Each marker's position is a running mean of every sighting;
+# once it has MARKER_MIN_OBSERVATIONS, sightings further than
+# MARKER_OUTLIER_DISTANCE (m) from the mean are thrown away.
+MARKER_OUTLIER_DISTANCE = 1.0
+MARKER_MIN_OBSERVATIONS = 3
+
+# Where /aruco/land and /aruco/roi get a marker's position from:
+#   False -> that averaged, outlier-filtered estimate; TF only as
+#            fallback.
+#   True  -> TF first. target_tf2_listener.py locks its map ->
+#            target_aruco_<id> frame on the FIRST sighting of a
+#            marker, so this means landing on one unfiltered frame.
+PREFER_TF = False
+
+# ---- Payloads ----------------------------------------------
+# YOLO label -> actuator. "drop_a" = Payload A (drop_rect),
+# "drop_b" = Payload B (drop_square). Labels must match what the
+# model emits (rostopic echo /target_detections/yolo | grep label).
+# One of each per mission: once a label has been dropped on it is
+# ignored for the rest of the flight.
+DIVERSION_ACTUATOR = {
+    "person": "drop_b",
+    "backpack": "drop_a",
+}
 
 # ============================================================
 # Mission state machine
@@ -151,73 +262,11 @@ pending_request = None
 # TF
 tf_buffer = None
 
-# Cached parameters (the detection callback runs at camera rate,
-# so it must not hit the parameter server per frame).
+# Frames - set from ~map_frame / ~camera_frame in main(). Cached as
+# globals because the detection callback runs at camera rate and
+# must not hit the parameter server per frame.
 MAP_FRAME = "map"
 CAMERA_FRAME = ""
-MARKER_OUTLIER_DISTANCE = 1.0
-MARKER_MIN_OBSERVATIONS = 3
-
-# Search-area bounds for the lawnmower scan. These are the same
-# bounds the pattern has always covered - only the LANE SPACING
-# within them is now generated (see generate_lawnmower_waypoints()),
-# based on ~scan_height, rather than fixed at 1.0 m.
-SEARCH_X_MIN = -2.5
-SEARCH_X_MAX = 2.5
-SEARCH_Y_MIN = -2.5
-SEARCH_Y_MAX = 2.5
-
-# Altitude the UAV flies the scan at, and also what execute_request()
-# transits at when approaching a target for a manual /aruco/land or
-# /aruco/roi request - there is deliberately no separate "approach
-# height": whatever altitude is safe/intended for the scan is equally
-# safe to transit at, and a fixed, independent approach altitude (the
-# old APPROACH_HEIGHT) meant a low ~scan_height caused an unwanted climb
-# before every diversion/landing approach. Set from ~scan_height in
-# main(); mid-scan diversions get this passed down as scan_height
-# instead of reading the global directly, since that value is already
-# being threaded through send_wps() -> handle_diversion() by parameter.
-SCAN_HEIGHT = 2.0
-
-# Altitude for the "roi" action - descend to here and hold.
-ROI_HEIGHT = 1.5
-
-# Altitude to descend to over a person/backpack before firing the
-# actuator (B1: "descend to a height of 0.5 m from each detected
-# target").
-DROP_HEIGHT = 0.5
-
-# Seconds to hold station AT DROP_HEIGHT before firing the actuator
-# (B1: "hover... for five seconds to ensure accurate payload
-# deployment").
-HOVER_BEFORE_DROP = 5.0
-
-# Seconds to hold station over a diversion target after firing the
-# actuator, before climbing back to scan height and resuming.
-ACTUATOR_HOLD = 2.0
-
-# True  -> resolve_frame() uses a live map -> frame TF lookup first,
-#          falling back to the averaged detection estimate.
-# False -> the reverse.
-PREFER_TF = True
-
-# ------------------------------------------------------------
-# Mid-scan diversion targets.
-#
-# YOLO class label -> which actuator service to call.
-# "drop_a" = Payload A (drop_rect), "drop_b" = Payload B (drop_square).
-#
-# These are the raw labels from /target_detections/yolo, NOT frame
-# names: person/backpack detections are handled straight off the
-# topic and never go through TF. Check the labels your model emits
-# with:
-#     rostopic echo /target_detections/yolo | grep label
-# ------------------------------------------------------------
-
-DIVERSION_ACTUATOR = {
-    "person": "drop_b",
-    "backpack": "drop_a",
-}
 
 
 # ============================================================
@@ -336,14 +385,15 @@ def _send_and_wait(spar_client, goal, action_name):
     return True
 
 
-def send_wp(spar_client, x, y, z, yaw, wait_time=2.0):
+def send_wp(spar_client, x, y, z, yaw, wait_time=None):
 
-    # NOTE: keep this default in sync with send_wp_scan().
-    speed = rospy.get_param("~speed", 0.5)
+    # None rather than a WAYPOINT_SETTLE default: a default argument is
+    # evaluated once at import, before load_params() has applied any
+    # launch-time override.
+    if wait_time is None:
+        wait_time = WAYPOINT_SETTLE
 
-    accuracy = rospy.get_param("~accuracy", 0.1)
-
-    goal = _build_goto_goal(x, y, z, yaw, speed, accuracy)
+    goal = _build_goto_goal(x, y, z, yaw, SPEED, ACCURACY)
 
     rospy.loginfo("Sending waypoint: [%.2f, %.2f, %.2f]", x, y, z)
 
@@ -452,7 +502,7 @@ def has_pending_diversion():
         return bool(pending_diversions)
 
 
-def send_wp_scan(spar_client, x, y, z, yaw):
+def send_wp_scan(spar_client, x, y, z, yaw, interruptible=True):
     """Fly to a scan waypoint, abandoning it if a target appears.
 
     Returns (success, interrupted).
@@ -460,15 +510,11 @@ def send_wp_scan(spar_client, x, y, z, yaw):
     Unlike send_wp(), this polls instead of blocking on
     wait_for_result(), so a detection arriving mid-leg can cancel the
     goal and stop the UAV where it is rather than at the end of the
-    leg.
+    leg. interruptible=False flies the whole leg regardless of raw
+    sightings (used once a leg has run out of stall retries).
     """
 
-    # NOTE: keep this default in sync with send_wp().
-    speed = rospy.get_param("~speed", 0.7)
-
-    accuracy = rospy.get_param("~accuracy", 0.1)
-
-    goal = _build_goto_goal(x, y, z, yaw, speed, accuracy)
+    goal = _build_goto_goal(x, y, z, yaw, SPEED, SCAN_ACCURACY)
 
     rospy.loginfo("Sending waypoint: [%.2f, %.2f, %.2f]", x, y, z)
 
@@ -481,7 +527,7 @@ def send_wp_scan(spar_client, x, y, z, yaw):
         if spar_client.wait_for_result(poll):
             break
 
-        if has_pending_diversion():
+        if interruptible and has_pending_diversion():
 
             rospy.logwarn("Target detected mid-leg - cancelling waypoint and " "stopping here.")
 
@@ -557,9 +603,9 @@ def get_breadcrumb_path(srvc_bc, start, end):
 
 def find_nearby_valid_waypoint(srvc_bc, start, target):
 
-    step = rospy.get_param("~fallback_step", 0.25)
+    step = FALLBACK_STEP
 
-    max_radius = rospy.get_param("~fallback_max_radius", 1.0)
+    max_radius = FALLBACK_MAX_RADIUS
 
     yaw = target[3]
 
@@ -697,15 +743,14 @@ def takeoff(spar_client, height):
 
     goal.position.z = height
 
-    goal.velocity_vertical = rospy.get_param("~takeoff_speed", 0.5)
+    goal.velocity_vertical = TAKEOFF_SPEED
 
     goal.wait_for_convergence = True
 
     # spar rejects the goal outright if yaw_range <= 0 whenever
     # wait_for_convergence is set, even though take-off holds yaw.
-    accuracy = rospy.get_param("~accuracy", 0.1)
-    goal.position_radius = accuracy
-    goal.yaw_range = accuracy
+    goal.position_radius = ACCURACY
+    goal.yaw_range = ACCURACY
 
     rospy.loginfo("Taking off to %.2f m...", height)
 
@@ -728,7 +773,7 @@ def land(spar_client):
 
     goal.motion = FlightMotionGoal.MOTION_LAND
 
-    goal.velocity_vertical = rospy.get_param("~landing_speed", 0.2)
+    goal.velocity_vertical = LANDING_SPEED
 
     rospy.loginfo("Sending landing command...")
 
@@ -829,8 +874,10 @@ def detection_callback(msg):
 
         position = _transform_detection_position(msg.header, detection)
 
+        # continue, not return: one failed transform must not discard
+        # the other markers in the same message.
         if position is None:
-            return
+            continue
 
         update_frame_estimate(frame_name_for(detection), position)
 
@@ -1448,7 +1495,7 @@ def navigate_to_point(spar_client, srvc_bc, path_pub, target, yaw=0.0):
         actual_target[1],
         actual_target[2],
         actual_target[3],
-        wait_time=2.0,
+        wait_time=WAYPOINT_SETTLE,
     )
 
     if not success:
@@ -1556,7 +1603,9 @@ def execute_request(request, spar_client, srvc_bc, path_pub):
 
         rospy.loginfo("Descending to ROI height %.2f m over '%s'...", ROI_HEIGHT, frame_name)
 
-        success = send_wp(spar_client, position[0], position[1], ROI_HEIGHT, 0.0, wait_time=2.0)
+        success = send_wp(
+            spar_client, position[0], position[1], ROI_HEIGHT, 0.0, wait_time=WAYPOINT_SETTLE
+        )
 
         if not success:
 
@@ -1622,11 +1671,10 @@ def generate_lawnmower_waypoints(x_min, x_max, y_min, y_max, height, hfov_deg, l
 
         footprint = 2 * height * tan(hfov_deg / 2)
 
-    which assumes the camera's HORIZONTAL FOV axis is aligned with x
-    (cross-track) at yaw = 0.0 - the same assumption the rest of this
-    script makes by flying every waypoint at yaw = 0.0. If the OAK-D
-    Pro is mounted rotated 90 degrees relative to the frame, pass its
-    vertical FOV instead.
+    hfov_deg must be the FOV of the image the detector sees (see
+    DETECTION_HFOV_DEG). That image is square, so its horizontal and
+    vertical FOV are equal and the camera's mounting rotation about
+    the vertical axis doesn't matter.
 
     Enough lanes are generated, evenly spaced, that no two adjacent
     lanes are further apart than that footprint - so their ground
@@ -1640,11 +1688,13 @@ def generate_lawnmower_waypoints(x_min, x_max, y_min, y_max, height, hfov_deg, l
     dropouts near the edge of frame. 0.0 = footprint edges just touch.
 
     Returns a list of [x, y, z, yaw] waypoints in the same format the
-    rest of this script already expects: each lane has 3 points
-    (near edge, y-midpoint, far edge) alternating direction lane to
-    lane, so a mid-scan diversion only has to re-plan half a lane
-    instead of the whole thing - exactly as the original fixed
-    pattern did.
+    rest of this script already expects: each lane has 2 points
+    (near edge, far edge), alternating direction lane to lane, so
+    each lane is flown as one continuous pass. There is no mid-lane
+    waypoint: every waypoint is a full stop (SPAR waits for
+    convergence), and a diversion loses no coverage without one,
+    because send_wps() re-plans from wherever the UAV actually is to
+    the end of the current lane.
     """
 
     if height <= 0.0:
@@ -1691,8 +1741,6 @@ def generate_lawnmower_waypoints(x_min, x_max, y_min, y_max, height, hfov_deg, l
         width,
     )
 
-    y_mid = (y_min + y_max) / 2.0
-
     wps = []
 
     for i, x in enumerate(x_positions):
@@ -1702,9 +1750,9 @@ def generate_lawnmower_waypoints(x_min, x_max, y_min, y_max, height, hfov_deg, l
         # differing in only ONE axis (never a diagonal across the
         # search area, which would skip whatever it cuts across).
         if i % 2 == 0:
-            lane_ys = [y_min, y_mid, y_max]
+            lane_ys = [y_min, y_max]
         else:
-            lane_ys = [y_max, y_mid, y_min]
+            lane_ys = [y_max, y_min]
 
         for y in lane_ys:
             wps.append([x, y, height, 0.0])
@@ -1763,14 +1811,14 @@ def send_wps(
     #
     # The segment loop below assumes the UAV is already at
     # wps[0], so it has to actually be put there. Skipping this
-    # (~do_takeoff:=false) keeps the old behaviour: the UAV is
+    # (DO_TAKEOFF = False) keeps the old behaviour: the UAV is
     # assumed to be airborne at wps[0] already, e.g. because
     # `rosrun spar_node takeoff` was run by hand first.
     # ========================================================
 
     set_state(MissionState.INITIALISATION)
 
-    if rospy.get_param("~do_takeoff", True):
+    if DO_TAKEOFF:
 
         announce("Taking off")
 
@@ -1810,6 +1858,12 @@ def send_wps(
         # flaky detection on one lane doesn't eat into another lane's
         # retry budget.
         segment_stall_retries = 0
+
+        # Set once this segment has used up its stall retries: the rest
+        # of the leg is then flown without stopping for raw sightings.
+        # Confirmed targets are still picked up at the end of the leg
+        # (take_pending_roi_diversion() below), so a real one isn't lost.
+        ignore_raw_sightings = False
 
         # ----------------------------------------------------
         # Re-planning loop for this segment. Runs more than once
@@ -1916,7 +1970,9 @@ def send_wps(
                     z,
                 )
 
-                success, interrupted = send_wp_scan(spar_client, x, y, z, actual_end[3])
+                success, interrupted = send_wp_scan(
+                    spar_client, x, y, z, actual_end[3], interruptible=not ignore_raw_sightings
+                )
 
                 if not success:
 
@@ -2008,12 +2064,22 @@ def send_wps(
                                 diverted = True
                                 break
 
+                            # Out of retries. Still re-plan from the stop
+                            # point - just continuing the for loop would
+                            # end the segment here (the interrupted point
+                            # is usually the leg's end) and skip the rest
+                            # of the leg - but fly it without stopping
+                            # for raw sightings this time.
                             rospy.logwarn(
                                 "Stopped %d times on unconfirmed "
-                                "sightings for this leg - giving up on "
-                                "the hold and continuing the pattern.",
+                                "sightings for this leg - flying the rest "
+                                "of it without stopping for sightings.",
                                 segment_stall_retries,
                             )
+
+                            ignore_raw_sightings = True
+                            diverted = True
+                            break
 
                 if entry is not None:
 
@@ -2055,7 +2121,7 @@ def send_wps(
         # Pause at endpoint
         # ----------------------------------------------------
 
-        rospy.sleep(2.0)
+        rospy.sleep(SEGMENT_END_PAUSE)
 
         with state_lock:
 
@@ -2170,6 +2236,75 @@ def send_wps(
 # ============================================================
 
 
+# Tunables from the top of this file that can be overridden at launch,
+# each as a private param with the same name in lower case.
+# DETECTION_HFOV_DEG is handled separately (see main()).
+TUNABLE_PARAMS = [
+    "SEARCH_X_MIN",
+    "SEARCH_X_MAX",
+    "SEARCH_Y_MIN",
+    "SEARCH_Y_MAX",
+    "SCAN_HEIGHT",
+    "ROI_HEIGHT",
+    "DROP_HEIGHT",
+    "SPEED",
+    "TAKEOFF_SPEED",
+    "LANDING_SPEED",
+    "ACCURACY",
+    "SCAN_ACCURACY",
+    "DO_TAKEOFF",
+    "HOVER_BEFORE_DROP",
+    "ACTUATOR_HOLD",
+    "WAYPOINT_SETTLE",
+    "SEGMENT_END_PAUSE",
+    "DIVERSION_CONFIRM_TIMEOUT",
+    "MAX_UNCONFIRMED_STALL_RETRIES",
+    "LANE_OVERLAP",
+    "FALLBACK_STEP",
+    "FALLBACK_MAX_RADIUS",
+    "MARKER_OUTLIER_DISTANCE",
+    "MARKER_MIN_OBSERVATIONS",
+    "PREFER_TF",
+]
+
+
+def load_params():
+    """Apply launch-time overrides (e.g. _scan_height:=2.5) on top of
+    the defaults at the top of this file, and log the values in use."""
+
+    module = globals()
+
+    for name in TUNABLE_PARAMS:
+
+        module[name] = rospy.get_param("~" + name.lower(), module[name])
+
+        rospy.loginfo("  %-30s = %s", name, module[name])
+
+
+def detection_hfov_from_camera_info(topic, timeout):
+    """Horizontal FOV (degrees) of the image YOLO sees, or None.
+
+    camera_info describes the full 16:9 video. The NN input is a centre
+    square crop of it with side = the video's shorter edge (the OAK-D
+    preview keeps aspect ratio by cropping), so its half-width in video
+    pixels is height / 2, against the same fx.
+    """
+
+    try:
+        msg = rospy.wait_for_message(topic, CameraInfo, timeout=timeout)
+    except rospy.ROSException:
+        return None
+
+    fx = msg.K[0]
+
+    if fx <= 0.0 or msg.width == 0 or msg.height == 0:
+        return None
+
+    half_width = min(msg.width, msg.height) / 2.0
+
+    return degrees(2.0 * atan(half_width / fx))
+
+
 def main(args):
 
     global pending_request
@@ -2179,14 +2314,7 @@ def main(args):
 
     global MAP_FRAME
     global CAMERA_FRAME
-    global MARKER_OUTLIER_DISTANCE
-    global MARKER_MIN_OBSERVATIONS
-    global SCAN_HEIGHT
-    global ROI_HEIGHT
-    global DROP_HEIGHT
-    global HOVER_BEFORE_DROP
-    global ACTUATOR_HOLD
-    global PREFER_TF
+    global DETECTION_HFOV_DEG
 
     # anonymous=False on purpose: an anonymous node name would
     # mangle both the private parameters (~speed, ~accuracy...)
@@ -2196,6 +2324,10 @@ def main(args):
     # --------------------------------------------------------
     # Parameters
     # --------------------------------------------------------
+
+    rospy.loginfo("Mission parameters:")
+
+    load_params()
 
     action_ns = rospy.get_param("~action_topic", "spar/flight")
 
@@ -2226,54 +2358,37 @@ def main(args):
 
     CAMERA_FRAME = rospy.get_param("~camera_frame", "")
 
-    MARKER_OUTLIER_DISTANCE = rospy.get_param("~marker_outlier_distance", 1.0)
+    # Detection FOV for lane spacing: explicit launch param first, then
+    # measured from the camera's calibration, then the constant at the
+    # top of this file.
+    camera_info_topic = rospy.get_param("~camera_info_topic", "/depthai_node/camera/camera_info")
 
-    MARKER_MIN_OBSERVATIONS = rospy.get_param("~marker_min_observations", 3)
+    if rospy.has_param("~detection_hfov_deg"):
 
-    # Scan height, passable at launch (e.g. `_scan_height:=2.5` or a
-    # <param> in the launch file) - HLO-M-1 says the actual height
-    # is only decided per-team on the demo day, so this can't be a
-    # source constant.
-    SCAN_HEIGHT = rospy.get_param("~scan_height", 2.0)
+        DETECTION_HFOV_DEG = rospy.get_param("~detection_hfov_deg")
 
-    # OAK-D Pro IMX378 colour sensor HFOV. 69 deg is the fixed-focus
-    # variant's published HFOV (Luxonis datasheet); the auto-focus
-    # variant is 66 deg. Check which lens your kit's camera uses and
-    # override with this param if it differs - the lane spacing is
-    # only as accurate as this number.
-    CAMERA_HFOV_DEG = rospy.get_param("~camera_hfov_deg", 69.0)
+        rospy.loginfo("Detection HFOV %.1f deg (from ~detection_hfov_deg).", DETECTION_HFOV_DEG)
 
-    # Fraction of the footprint to overlap between adjacent lanes,
-    # on top of full coverage. 0.0 = edges just touch, which leaves
-    # zero margin for real-world error (yaw/position tolerance,
-    # lens distortion at the edge of frame, HFOV spec being nominal
-    # rather than measured) - any of those turns "edges touch" into
-    # "edges have a gap". Default to some margin instead.
-    LANE_OVERLAP = rospy.get_param("~lane_overlap", 0.2)
+    else:
 
-    # How long to wait, after stopping for a raw sighting, for IMG's
-    # own consistency filter (target_tf2_listener.py: 5 sightings
-    # within 30 cm) to actually confirm it before giving up and
-    # resuming the scan.
-    DIVERSION_CONFIRM_TIMEOUT = rospy.get_param("~diversion_confirm_timeout", 4.0)
+        measured = detection_hfov_from_camera_info(camera_info_topic, timeout=5.0)
 
-    # A raw sighting that never confirms stops the UAV mid-leg without
-    # ever reaching the requested point - see the stall-retry handling
-    # in send_wps(). This caps how many times in a row that's allowed
-    # to happen on the same leg before giving up on the hold and
-    # continuing the pattern anyway, so a persistently flickering
-    # false positive can't stall the mission forever.
-    MAX_UNCONFIRMED_STALL_RETRIES = rospy.get_param("~max_unconfirmed_stall_retries", 3)
+        if measured is not None:
 
-    ROI_HEIGHT = rospy.get_param("~roi_height", 1.5)
+            DETECTION_HFOV_DEG = measured
 
-    DROP_HEIGHT = rospy.get_param("~drop_height", 0.5)
+            rospy.loginfo(
+                "Detection HFOV %.1f deg (measured from %s).", DETECTION_HFOV_DEG, camera_info_topic
+            )
 
-    HOVER_BEFORE_DROP = rospy.get_param("~hover_before_drop", 5.0)
+        else:
 
-    ACTUATOR_HOLD = rospy.get_param("~actuator_hold", 2.0)
-
-    PREFER_TF = rospy.get_param("~prefer_tf", True)
+            rospy.logwarn(
+                "No camera_info on %s within 5 s - using fallback detection "
+                "HFOV %.1f deg for lane spacing.",
+                camera_info_topic,
+                DETECTION_HFOV_DEG,
+            )
 
     # --------------------------------------------------------
     # TF
@@ -2421,7 +2536,7 @@ def main(args):
         path_pub,
         actuator_srvs,
         SCAN_HEIGHT,
-        CAMERA_HFOV_DEG,
+        DETECTION_HFOV_DEG,
         LANE_OVERLAP,
         DIVERSION_CONFIRM_TIMEOUT,
         MAX_UNCONFIRMED_STALL_RETRIES,
