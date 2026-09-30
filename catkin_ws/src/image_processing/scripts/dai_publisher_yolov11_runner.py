@@ -200,22 +200,47 @@ class DepthaiCamera():
                 counter = 0
                 fps = 0
 
+                # The NN passthrough frame and its detections arrive on two
+                # separate queues and aren't guaranteed to land in the same
+                # loop iteration. Each is held here until its partner (same
+                # sequence number) arrives - previously a lone one was
+                # discarded, and its partner then arrived alone on the next
+                # iteration and was discarded too, silently losing both.
+                inRgb = None
+                inDet = None
+
                 while not rospy.is_shutdown():
                     # Blocks (briefly, ~1/CAM_FPS) rather than busy-polling.
                     # This is already hardware-encoded MJPEG bytes - no
                     # cv2.imencode needed on the Pi for this stream.
                     inVideo = q_video.get()
-                    self.publish_to_ros(bytes(inVideo.getData()))
+                    self.publish_to_ros(bytes(inVideo.getData()), self.ros_stamp(inVideo))
 
                     found_classes = []
-                    inRgb = q_nn_input.tryGet()
-                    inDet = q_nn.tryGet()
+                    newRgb = q_nn_input.tryGet()
+                    if newRgb is not None:
+                        inRgb = newRgb
+                    newDet = q_nn.tryGet()
+                    if newDet is not None:
+                        inDet = newDet
 
                     if inRgb is None or inDet is None:
                         continue
 
+                    # Mismatched pair: the older one's partner was dropped
+                    # (non-blocking queues), so it will never be matched.
+                    if inRgb.getSequenceNum() != inDet.getSequenceNum():
+                        if inRgb.getSequenceNum() < inDet.getSequenceNum():
+                            inRgb = None
+                        else:
+                            inDet = None
+                        continue
+
+                    stamp = self.ros_stamp(inDet)
                     frame = inRgb.getCvFrame()
                     detections = inDet.detections
+                    inRgb = None
+                    inDet = None
                     for detection in detections:
                         found_classes.append(detection.label)
                     found_classes = np.unique(found_classes)
@@ -223,8 +248,8 @@ class DepthaiCamera():
 
                     cv2.putText(overlay, "NN fps: {:.2f}".format(fps), (2, overlay.shape[0] - 4), cv2.FONT_HERSHEY_TRIPLEX, 0.4, (255, 0, 0))
                     cv2.putText(overlay, "Found classes {}".format(found_classes), (2, 10), cv2.FONT_HERSHEY_TRIPLEX, 0.4, (255, 0, 0))
-                    self.publish_detect_to_ros(overlay)
-                    self.publish_targets(detections)
+                    self.publish_detect_to_ros(overlay, stamp)
+                    self.publish_targets(detections, stamp)
 
                     counter += 1
                     if (time.time() - start_time) > 1:
@@ -244,7 +269,19 @@ class DepthaiCamera():
             self.dist_coeffs = None
             rospy.sleep(2.0)  # brief backoff before main() retries run()
 
-    def publish_to_ros(self, jpeg_bytes):
+    def ros_stamp(self, dai_msg):
+        """Capture time of a DepthAI message, as a ROS time.
+
+        getTimestamp() is when the camera captured the frame, on the host's
+        monotonic clock (dai.Clock) - not wall/ROS time. Converted via the
+        message's age, so downstream TF lookups get the UAV's pose at
+        capture rather than at publish, which is 100 ms+ later once NN
+        inference and USB transfer are included.
+        """
+        age = dai.Clock.now() - dai_msg.getTimestamp()
+        return rospy.Time.now() - rospy.Duration.from_sec(age.total_seconds())
+
+    def publish_to_ros(self, jpeg_bytes, stamp):
         # jpeg_bytes comes pre-encoded from the on-device VideoEncoder -
         # no cv2.imencode here, this is just message construction.
         #
@@ -258,23 +295,23 @@ class DepthaiCamera():
         # alone here since nothing about the video message itself feeds a
         # transform.
         msg_out = CompressedImage()
-        msg_out.header.stamp = rospy.Time.now()
+        msg_out.header.stamp = stamp
         msg_out.format = "jpeg"
         msg_out.header.frame_id = "home"
         msg_out.data = jpeg_bytes
         self.pub_image.publish(msg_out)
 
-    def publish_detect_to_ros(self, frame):
+    def publish_detect_to_ros(self, frame, stamp):
         msg_out = CompressedImage()
-        msg_out.header.stamp = rospy.Time.now()
+        msg_out.header.stamp = stamp
         msg_out.format = "jpeg"
         msg_out.header.frame_id = "home"
         msg_out.data = np.array(cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])[1]).tobytes()
         self.pub_image_detect.publish(msg_out)
 
-    def publish_targets(self, detections):
+    def publish_targets(self, detections, stamp):
         msg_out = TargetDetectionArray()
-        msg_out.header.stamp = rospy.Time.now()
+        msg_out.header.stamp = stamp
         # Was hardcoded "camera_frame" - see self.camera_frame_id comment
         # in __init__ for why that never resolved in TF.
         msg_out.header.frame_id = self.camera_frame_id
