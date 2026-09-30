@@ -296,10 +296,24 @@ def get_state():
         return mission_state
 
 
-def scan_is_complete():
-    """True once the scan has left INITIALISATION/SEARCH/DIVERT."""
+def request_rejection():
+    """Why a land/ROI request can't be accepted now, or None if it can.
 
-    return get_state() not in SCAN_ACTIVE_STATES
+    Takes state_lock itself (via get_state()), so must not be called
+    while holding it.
+    """
+
+    state = get_state()
+
+    if state in SCAN_ACTIVE_STATES:
+        return "Scan is not complete yet."
+
+    # After a landing the UAV is on the ground (and may have disarmed);
+    # a further request would send a GOTO from there.
+    if state == MissionState.LANDING:
+        return "UAV has landed - no further requests accepted."
+
+    return None
 
 
 def set_state(new_state):
@@ -1308,15 +1322,17 @@ def queue_request(action, frame_name):
 
         return FrameTargetResponse(success=False, message="No frame name given.")
 
-    # Deliberately outside the lock: scan_is_complete() takes it itself
+    # Deliberately outside the lock: request_rejection() takes it itself
     # (via get_state()), and state_lock is a plain, non-reentrant
     # threading.Lock() - acquiring it again from inside an already-held
     # `with state_lock:` block would deadlock this thread against itself
     # forever, not just briefly block. That was the actual bug behind
     # /aruco/land hanging with no response and no further log output.
-    if not scan_is_complete():
+    rejection = request_rejection()
 
-        return FrameTargetResponse(success=False, message="Scan is not complete yet.")
+    if rejection is not None:
+
+        return FrameTargetResponse(success=False, message=rejection)
 
     with state_lock:
 
@@ -1398,14 +1414,16 @@ def landing_point_callback(msg):
 
     global pending_request
 
-    # Same reasoning as queue_request(): scan_is_complete() takes
+    # Same reasoning as queue_request(): request_rejection() takes
     # state_lock itself, so it must not be called from inside a
     # `with state_lock:` block - state_lock is a plain, non-reentrant
     # threading.Lock(), and re-acquiring it from the same thread
     # deadlocks that thread against itself permanently.
-    if not scan_is_complete():
+    rejection = request_rejection()
 
-        rospy.logwarn("Landing point received before the scan " "finished - ignoring.")
+    if rejection is not None:
+
+        rospy.logwarn("Landing point ignored: %s", rejection)
 
         return
 
@@ -1537,10 +1555,13 @@ def execute_request(request, spar_client, srvc_bc, path_pub):
 
     if action == "land_point":
 
-        target = request[1]
+        # Only x/y are used. Transit is at SCAN_HEIGHT, same as frame
+        # requests below - flying to the point's own z first meant a
+        # z=0 request dragged the UAV along the ground to the spot.
+        target = [request[1][0], request[1][1], SCAN_HEIGHT]
 
         rospy.loginfo(
-            "EXECUTING: land at manual point " "[%.2f, %.2f, %.2f]",
+            "EXECUTING: land at manual point " "[%.2f, %.2f] (transit at %.2f m)",
             target[0],
             target[1],
             target[2],
@@ -2104,6 +2125,14 @@ def send_wps(
                         entry["label"],
                         entry["position"],
                     )
+
+                    # Raw sightings that came in while diverting (e.g.
+                    # of the target just dropped on, before it was
+                    # marked handled) are stale - left queued, they
+                    # would stop the re-planned leg immediately and
+                    # burn a stall retry. Anything real is re-seen.
+                    with state_lock:
+                        pending_diversions.clear()
 
                     diverted = True
                     break
