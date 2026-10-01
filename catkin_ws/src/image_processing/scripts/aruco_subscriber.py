@@ -17,6 +17,13 @@ from image_processing.msg import TargetDetection, TargetDetectionArray
 # rather than pinning to either.
 _HAS_ARUCO_DETECTOR = hasattr(cv2.aruco, 'ArucoDetector')
 
+############################### Parameters ###############################
+# Detection only runs on every Nth received frame, like YOLO's DETECT_EVERY_N
+# in dai_publisher_yolov11_runner.py. Skipped frames return before the JPEG
+# decode, so they cost almost nothing. 1 = detect on every frame. Override
+# at launch with ~detect_every_n.
+DETECT_EVERY_N = 5
+
 
 class ArucoDetector():
     # ArUco dictionary and parameters. Everything else this node uses
@@ -61,6 +68,9 @@ class ArucoDetector():
         self.viz_width = rospy.get_param('~viz_width', 640)
         self.viz_period = 1.0 / rospy.get_param('~viz_rate', 5.0)
         self.last_viz_time = 0.0
+
+        self.detect_every_n = max(1, int(rospy.get_param('~detect_every_n', DETECT_EVERY_N)))
+        self.frame_count = 0
 
         # Publisher: structured detections (label, id, confidence, 3D position)
         # consumed by NAV for landing-marker selection / waypoint storage.
@@ -132,6 +142,11 @@ class ArucoDetector():
         if self.camera_matrix is None:
             # No real calibration received yet - skip rather than use guessed values
             rospy.logwarn_throttle(5, "Waiting for camera_info before running ArUco detection...")
+            return
+
+        # Decimate before decoding - see DETECT_EVERY_N at the top.
+        self.frame_count += 1
+        if self.frame_count % self.detect_every_n != 0:
             return
 
         # The annotated stream is only for humans in rqt/Rviz. When nobody is
