@@ -50,10 +50,10 @@ SEARCH_Y_MAX = 2.8
 # flown at. HLO-M-1 allows 1.5-4.0 m; decided per team on the day.
 SCAN_HEIGHT = 2.0
 ROI_HEIGHT = 1.5    # /aruco/roi: descend to here over the marker and hold
-DROP_HEIGHT = 0.5   # descend to here over a person/backpack before dropping (B1)
+DROP_HEIGHT = 0.8   # descend to here over a person/backpack before dropping (B1)
 
 # ---- Speeds (m/s) and accuracy -----------------------------
-SPEED = 0.5          # every waypoint - scan legs, transits and diversions
+SPEED = 0.4          # every waypoint - scan legs, transits and diversions
 TAKEOFF_SPEED = 0.5
 LANDING_SPEED = 0.2
 ACCURACY = 0.1       # how close counts as "reached" (m, and rad for yaw)
@@ -1339,6 +1339,21 @@ def queue_request(action, frame_name):
         if pending_request is not None:
 
             return FrameTargetResponse(success=False, message="A request is already in progress.")
+
+        # Only frames this node actually detected. Without this,
+        # resolve_frame()'s TF fallback would accept any frame in the
+        # TF tree (map, the UAV body, a stale target frame) as a
+        # land/ROI target.
+        detected = frame_name in frame_estimates
+
+    if not detected:
+
+        rospy.logwarn("Rejecting '%s' for frame '%s': not detected.", action, frame_name)
+
+        return FrameTargetResponse(
+            success=False,
+            message="Frame '%s' has not been detected - refusing to %s there." % (frame_name, action),
+        )
 
     # Resolved outside the lock: resolve_frame() may block for up
     # to 0.5 s on a TF lookup, and the detection callback needs
