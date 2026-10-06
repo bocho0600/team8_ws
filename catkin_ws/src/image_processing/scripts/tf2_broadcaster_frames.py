@@ -39,7 +39,7 @@ def send_tf_camera():
 	# the UAV's z. A yaw of -90 here is -90 about the UAV's z, which reads as
 	# +90 when looking through the lens. Negate it if you're matching what you
 	# see in the image rather than the airframe.
-	yaw = math.radians(rospy.get_param('~camera_yaw_deg', 1.0*math.pi))
+	yaw = math.radians(rospy.get_param('~camera_yaw_deg', 0))
 	q = tf_conversions.transformations.quaternion_from_euler(0, math.pi, yaw)
 	t.transform.rotation.x = q[0]
 	t.transform.rotation.y = q[1]
