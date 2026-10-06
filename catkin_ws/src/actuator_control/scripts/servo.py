@@ -109,7 +109,7 @@ if __name__ == '__main__':
         exit(1)
 
     # Define the GPIO pin for the servo
-    SERVO_GPIO = 12 # Adjust this to your GPIO pin
+    SERVO_GPIO = 16 # Adjust this to your GPIO pin
     # Setup the GPIO as output (done automatically when setting pulsewidth)
 
     drop_lock = threading.Lock()
