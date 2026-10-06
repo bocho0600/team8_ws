@@ -322,10 +322,16 @@ class DepthaiCamera():
             target.marker_id = -1  # not applicable for YOLO detections
             target.confidence = float(detection.confidence)
             # spatialCoordinates are in millimetres - convert to metres to match
-            # the ArUco node's units
+            # the ArUco node's units.
+            #
+            # y is negated: DepthAI's spatial Y points UP the image, but the
+            # "camera" TF frame (and ArUco's solvePnP tvec) is the OpenCV
+            # optical frame, where Y points DOWN. Without this, YOLO targets
+            # come out mirrored along the image's vertical axis - with the
+            # current mount, that's in front of / behind the UAV.
             target.position = Point(
                 x=detection.spatialCoordinates.x / 1000.0,
-                y=detection.spatialCoordinates.y / 1000.0,
+                y=-detection.spatialCoordinates.y / 1000.0,
                 z=detection.spatialCoordinates.z / 1000.0)
             msg_out.detections.append(target)
 
