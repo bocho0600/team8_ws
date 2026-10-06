@@ -40,10 +40,10 @@ from image_processing.msg import TargetDetectionArray
 
 # ---- Search area (map frame, metres) -----------------------
 # The lawnmower scan covers this whole rectangle.
-SEARCH_X_MIN = -2.5
-SEARCH_X_MAX = 2.5
-SEARCH_Y_MIN = -2.5
-SEARCH_Y_MAX = 2.5
+SEARCH_X_MIN = -2.8
+SEARCH_X_MAX = 2.8
+SEARCH_Y_MIN = -2.8
+SEARCH_Y_MAX = 2.8
 
 # ---- Heights (metres) --------------------------------------
 # SCAN_HEIGHT is also the altitude every transit to a target is
