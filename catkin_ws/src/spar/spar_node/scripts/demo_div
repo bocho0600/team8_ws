@@ -125,6 +125,13 @@ MARKER_MIN_OBSERVATIONS = 3
 #            marker, so this means landing on one unfiltered frame.
 PREFER_TF = False
 
+# ---- ArUco false-positive filter ---------------------------
+# YOLO sometimes sees part of an ArUco marker as a backpack/person.
+# Any person/backpack sighting within ARUCO_EXCLUSION_RADIUS (m,
+# horizontal) of a known ArUco marker's averaged position is ignored.
+# 0 disables the filter.
+ARUCO_EXCLUSION_RADIUS = 0.3
+
 # ---- Payloads ----------------------------------------------
 # YOLO label -> actuator. "drop_a" = Payload A (drop_rect),
 # "drop_b" = Payload B (drop_square). Labels must match what the
@@ -290,6 +297,17 @@ def announce(text):
         voice_pub.publish(String(data=text))
 
 
+def spoken_number(value):
+    """Format a coordinate for espeak, e.g. -1.25 -> "minus 1.3"."""
+
+    text = "%.1f" % value
+
+    if text == "-0.0":
+        return "0.0"
+
+    return "minus " + text[1:] if text.startswith("-") else text
+
+
 def get_state():
 
     with state_lock:
@@ -316,10 +334,13 @@ def request_rejection():
     return None
 
 
-def set_state(new_state):
+def set_state(new_state, phrase=None):
     """Transition to new_state. No-op (no log, no publish) if
     already in that state, so re-entering SEARCH after every
     diversion doesn't spam the topic.
+
+    phrase, if given, is announced instead of the state's default
+    STATE_ANNOUNCEMENTS entry.
     """
 
     global mission_state
@@ -339,7 +360,8 @@ def set_state(new_state):
 
         mission_state_pub.publish(String(data=new_state.value))
 
-    phrase = STATE_ANNOUNCEMENTS.get(new_state)
+    if phrase is None:
+        phrase = STATE_ANNOUNCEMENTS.get(new_state)
 
     if phrase is not None:
         announce(phrase)
@@ -425,8 +447,8 @@ def yolo_callback(msg):
     still near it - does NOT resolve a position and does NOT by
     itself trigger a diversion.
 
-    Deliberately back to not touching TF, same as the very first
-    version of this node: the resolved, consistency-filtered position
+    TF is used only to drop sightings that sit on a known ArUco
+    marker (see _near_aruco_locked()); the resolved, consistency-filtered position
     that actually matters now comes from IMG's own pipeline
     (target_tf2_broadcaster.py + target_tf2_listener.py) via
     roi_callback() below, once it's confirmed - not from a raw,
@@ -442,12 +464,19 @@ def yolo_callback(msg):
         if label not in DIVERSION_ACTUATOR:
             continue
 
+        # Best effort: if the transform fails, fall through and let
+        # roi_callback() apply the same check on the confirmed position.
+        position = _transform_detection_position(msg.header, detection)
+
         with state_lock:
 
             if label in handled_targets:
                 continue
 
             if label in pending_diversions:
+                continue
+
+            if position is not None and _near_aruco_locked(label, position):
                 continue
 
             pending_diversions.append(label)
@@ -491,6 +520,11 @@ def roi_callback(msg):
             # is a harmless second line of defence.
             return
 
+        if _near_aruco_locked(
+            label, [detection.position.x, detection.position.y, detection.position.z]
+        ):
+            return
+
         pending_roi_diversions.append(
             {
                 "label": label,
@@ -498,7 +532,10 @@ def roi_callback(msg):
             }
         )
 
-    announce("%s found" % label)
+    announce(
+        "%s found at x %s, y %s"
+        % (label, spoken_number(detection.position.x), spoken_number(detection.position.y))
+    )
 
     rospy.loginfo(
         "CONFIRMED diversion queued for '%s' at map [%.2f, %.2f, %.2f].",
@@ -507,6 +544,43 @@ def roi_callback(msg):
         detection.position.y,
         detection.position.z,
     )
+
+
+def _near_aruco_locked(label, position):
+    """True if position (map frame) is within ARUCO_EXCLUSION_RADIUS
+    of a known ArUco marker, i.e. the person/backpack sighting is
+    probably YOLO misreading the marker itself.
+
+    Caller MUST already hold state_lock.
+    """
+
+    if ARUCO_EXCLUSION_RADIUS <= 0:
+        return False
+
+    for frame_name in frame_estimates:
+
+        if not frame_name.startswith("target_aruco_"):
+            continue
+
+        marker = _estimate_locked(frame_name)
+
+        distance = sqrt((position[0] - marker[0]) ** 2 + (position[1] - marker[1]) ** 2)
+
+        if distance <= ARUCO_EXCLUSION_RADIUS:
+
+            rospy.logwarn_throttle(
+                2.0,
+                "Ignoring '%s' at map [%.2f, %.2f]: %.2f m from '%s' - " "likely the marker itself.",
+                label,
+                position[0],
+                position[1],
+                distance,
+                frame_name,
+            )
+
+            return True
+
+    return False
 
 
 def has_pending_diversion():
@@ -1667,7 +1741,12 @@ def execute_request(request, spar_client, srvc_bc, path_pub):
 
     if action == "land":
 
-        set_state(MissionState.LANDING)
+        if frame_name.startswith("target_aruco_"):
+            phrase = "Landing at ArUco %s" % frame_name[len("target_aruco_"):]
+        else:
+            phrase = None
+
+        set_state(MissionState.LANDING, phrase)
 
         rospy.loginfo("Descending onto '%s'...", frame_name)
 
@@ -2309,6 +2388,7 @@ TUNABLE_PARAMS = [
     "MARKER_OUTLIER_DISTANCE",
     "MARKER_MIN_OBSERVATIONS",
     "PREFER_TF",
+    "ARUCO_EXCLUSION_RADIUS",
 ]
 
 
