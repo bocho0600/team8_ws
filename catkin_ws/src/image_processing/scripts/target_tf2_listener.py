@@ -67,6 +67,14 @@ MIN_CONFIDENCE = 0.5    # ignore low-confidence YOLO boxes outright
 CONFIRM_COUNT = 5       # sightings required before a target is trusted
 MAX_SPREAD_M = 0.3      # max pairwise spread allowed in buffer (30 cm)
 
+# YOLO sometimes reads an ArUco marker as a backpack/person. Person/backpack
+# sightings within this horizontal distance (m) of a locked-in ArUco marker
+# are dropped BEFORE they reach the confirmation buffer. A target is
+# confirmed once per label, so a marker confirmed as "backpack" would be
+# dropped on and use up the label - the real backpack would never be sent.
+# 0 disables the filter.
+ARUCO_EXCLUSION_RADIUS = 0.3
+
 
 def standard_frame_name(detection):
     """Standard, permanent/base frame name - no suffix.
@@ -103,6 +111,7 @@ class TargetWorldEstimator():
 
         self.buffers = {}       # frame_name -> deque of (x, y, z) in map frame (YOLO only)
         self.confirmed = set()  # frame_names already saved/actioned - never reprocessed
+        self.aruco_positions = {}  # std_name -> locked (x, y, z) in map, for the exclusion filter
 
         # TargetDetectionArray (one detection) - see module docstring, point
         # 2, for why this is no longer a bare PoseStamped.
@@ -147,6 +156,7 @@ class TargetWorldEstimator():
                        t.transform.translation.z)
 
                 self.confirmed.add(std_name)
+                self.aruco_positions[std_name] = pos
                 self.broadcast_static_target(std_name, pos, msg_in.header.stamp)
                 rospy.loginfo(
                     "ArUco marker saved permanently as '%s' (live frame is "
@@ -181,6 +191,9 @@ class TargetWorldEstimator():
                    t.transform.translation.y,
                    t.transform.translation.z)
 
+            if self.near_aruco(det.label, pos):
+                continue
+
             buf = self.buffers.setdefault(std_name, deque(maxlen=BUFFER_LEN))
             buf.append(pos)
 
@@ -208,6 +221,22 @@ class TargetWorldEstimator():
 
         if world_msg.detections:
             self.pub_world.publish(world_msg)
+
+    def near_aruco(self, label, pos):
+        """True if pos (map) is within ARUCO_EXCLUSION_RADIUS (horizontal)
+        of a locked-in ArUco marker - i.e. YOLO is probably misreading the
+        marker itself. Only markers ArUco has already seen can be checked.
+        """
+        if ARUCO_EXCLUSION_RADIUS <= 0:
+            return False
+        for name, m in self.aruco_positions.items():
+            d = ((pos[0] - m[0]) ** 2 + (pos[1] - m[1]) ** 2) ** 0.5
+            if d <= ARUCO_EXCLUSION_RADIUS:
+                rospy.logwarn_throttle(
+                    2, "Ignoring '%s' at map (%.2f, %.2f): %.2f m from '%s' - "
+                    "likely the marker itself.", label, pos[0], pos[1], d, name)
+                return True
+        return False
 
     @staticmethod
     def is_confirmed(buf):

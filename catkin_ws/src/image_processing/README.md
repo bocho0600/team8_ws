@@ -447,13 +447,14 @@ camera → target     (the detection)
 ### 9.2 Person/backpack: confirmed by consistency
 
 1. Skip detections with confidence < 0.5.
-2. Resolve to `map`. Append the result to a buffer for that frame name (`deque(maxlen=BUFFER_LEN=5)`).
-3. The running estimate is the **mean of the buffer** (up to 5 points).
-4. The target is **confirmed** when the buffer holds `CONFIRM_COUNT = 5` points **and every pair** of them is within `MAX_SPREAD_M = 0.30 m` (3D distance).
-5. On confirmation, which happens **once per frame name** (and so once per label, because names are `target_person` and `target_backpack`):
+2. Resolve to `map`. **Drop the sighting if it is within `ARUCO_EXCLUSION_RADIUS = 0.3 m` (horizontal) of a locked-in ArUco marker**, logging `Ignoring '<label>' … likely the marker itself`. YOLO sometimes reads a marker as a backpack. Because a target is confirmed only once per label, letting those sightings into the buffer could use up the label on the marker, and the real target would never be sent. Only markers that ArUco has already locked in can be checked.
+3. Append the result to a buffer for that frame name (`deque(maxlen=BUFFER_LEN=5)`). There is one buffer per label, not one per location, and it holds the last 5 sightings however old they are.
+4. The running estimate is the **mean of the buffer** (up to 5 points).
+5. The target is **confirmed** when the buffer holds `CONFIRM_COUNT = 5` points **and every pair** of them is within `MAX_SPREAD_M = 0.30 m` (3D distance).
+6. On confirmation, which happens **once per frame name** (and so once per label, because names are `target_person` and `target_backpack`):
    - Publish **`/target_detection/roi`**: a `TargetDetectionArray` with **exactly one** detection (label, confidence, averaged map position), `frame_id: map`.
    - Publish `/emulated_uav/target_found` (`std_msgs/Time`, the confirmation stamp). This is left over from the tutorial and nothing in the repo subscribes to it.
-6. No permanent frame is kept for a person or backpack.
+7. No permanent frame is kept for a person or backpack.
 
 ### 9.3 World stream
 
@@ -642,7 +643,7 @@ These averaged estimates are what `/aruco/land` and `/aruco/roi` fly to. At the 
 The raw YOLO feed is used **only to stop the UAV**. It never decides a position and never fires a payload by itself.
 
 - For each detection whose label is in `DIVERSION_ACTUATOR` (`person`, `backpack`) and isn't already handled or pending, the label is added to `pending_diversions`.
-- **ArUco false-positive filter.** YOLO sometimes reads part of an ArUco marker as a backpack or person. Before queuing, `yolo_callback` makes a best-effort attempt to transform the sighting into `map` (the same TF chain as §14.2). If the sighting lies within `ARUCO_EXCLUSION_RADIUS = 0.3 m` **horizontally** of any known marker's averaged position in `frame_estimates`, it is ignored and a warning is logged (`Ignoring '<label>' … likely the marker itself`). If the transform fails, the sighting is kept, and the same check runs on the confirmed position in `roi_callback` (§14.4). Setting `ARUCO_EXCLUSION_RADIUS = 0` turns the filter off. It only works for markers already seen in this run, so a marker that YOLO sees before ArUco has detected it is not filtered.
+- **ArUco markers are not filtered here.** YOLO sometimes reads a marker as a backpack. `demo_div` will stop for such a raw sighting like any other, but the sighting can't lead to a drop: `target_tf2_listener` drops person/backpack sightings near a locked-in marker before they can confirm (§9.2), so the stop just times out (see below).
 - `send_wp_scan()` checks this list every 0.1 s while flying a scan leg. If it is not empty, the node cancels the SPAR goal, waits 0.5 s, and the UAV **holds where it is**.
 - Then `wait_for_confirmed_diversion()` waits up to `DIVERSION_CONFIRM_TIMEOUT = 4.0 s` for the listener to confirm the target (§14.4). The point of stopping is to hold still while the listener collects its 5 consistent sightings. At about 7.5 Hz YOLO, that takes at least about 0.7 s.
 - If nothing is confirmed in time:
@@ -654,7 +655,7 @@ The raw YOLO feed is used **only to stop the UAV**. It never decides a position 
 This is the path that actually leads to a payload drop:
 
 1. `target_tf2_listener` confirms a person or backpack (5 sightings, all within 30 cm) and publishes one detection in `map`.
-2. `roi_callback` checks that the label is in `DIVERSION_ACTUATOR`, is not yet handled, and is **not within `ARUCO_EXCLUSION_RADIUS` of a known ArUco marker** (the same filter as §14.3, applied to the confirmed position). It then queues `{label, position}` in `pending_roi_diversions` and announces `"<label> found at x <x>, y <y>"` on `/voice/say`. The coordinates are rounded to 0.1 m and spoken as words, e.g. "minus 1.3".
+2. `roi_callback` checks that the label is in `DIVERSION_ACTUATOR` and not yet handled. It then queues `{label, position}` in `pending_roi_diversions` and announces `"<label> found at x <x>, y <y>"` on `/voice/say`. The coordinates are rounded to 0.1 m and spoken as words, e.g. "minus 1.3".
 3. The scan loop takes the entry and calls `handle_diversion()`. During it, the mission state is `deployment`, and it returns to `search` afterwards. The position from the listener is used **as is**, without resolving it again. Its z is ignored; only x and y are flown to. The steps are:
    - Fly to `(x, y, SCAN_HEIGHT)` along a Breadcrumb path, with nearby fallback points if that spot is blocked.
    - Descend to `DROP_HEIGHT = 0.8 m` and hover for `HOVER_BEFORE_DROP = 5 s`.
@@ -713,7 +714,6 @@ demo_div params that relate to vision (all private, `_name:=value`):
 | `~prefer_tf` | `False` |
 | `~marker_outlier_distance` | 1.0 |
 | `~marker_min_observations` | 3 |
-| `~aruco_exclusion_radius` | 0.3 (m, horizontal; 0 disables the filter) |
 | `~diversion_confirm_timeout` | 4.0 |
 | `~max_unconfirmed_stall_retries` | 3 |
 | `~lane_overlap` | 0.2 |
@@ -824,6 +824,7 @@ Each script keeps its tunables near the top. Values marked "param" can be set at
 | `BUFFER_LEN` | 5 |
 | `CONFIRM_COUNT` | 5 |
 | `MAX_SPREAD_M` | 0.30 m |
+| `ARUCO_EXCLUSION_RADIUS` | 0.30 m (horizontal; 0 disables the filter) |
 
 TF lookup timeout: 0.5 s.
 
@@ -878,7 +879,7 @@ What to look for in the logs:
 ## 18. Known quirks and limitations
 
 1. **One person and one backpack per mission.** The listener's `confirmed` set and demo_div's `handled_targets` are both keyed by label, by design. A second person is never confirmed.
-2. **A failed diversion is not offered again.** The listener publishes each label's ROI only once. If `handle_diversion()` can't reach the target (Breadcrumb finds no path, or SPAR fails), that target is not re-sent until `target_tf2_listener` restarts. The same applies when demo_div's ArUco exclusion filter **rejects** a confirmed ROI. The listener has already marked that label as confirmed, so if the rejected detection really was the marker, a real backpack or person found later in the flight is never offered.
+2. **A failed diversion is not offered again.** The listener publishes each label's ROI only once. If `handle_diversion()` can't reach the target (Breadcrumb finds no path, or SPAR fails), that target is not re-sent until `target_tf2_listener` restarts. A marker misread as a backpack no longer uses up the label: `target_tf2_listener` drops those sightings before they can confirm (§9.2). The exception is a marker that YOLO sees before ArUco has locked it in. That case can still confirm, and the UAV would then divert and drop on the marker.
 3. **The ArUco static frame is set from a single sighting.** `map → target_aruco_<id>` comes from the first detection and is never refined. A glancing first detection is kept for good. This is why demo_div defaults to `PREFER_TF = False` and uses its own averaged, outlier-filtered estimate.
 4. **The keep-alive cache re-stamps camera-relative offsets with the current time.** After the UAV moves, a `Time(0)` lookup of `map → target_*_temp` combines the old camera offset with the UAV's **current** pose, which gives a wrong position without any error. Only lookups at the detection's own stamp (as the listener does) are correct. demo_div's `resolve_frame()` docstring explains the same problem.
 5. **No target orientation.** Every target frame has identity rotation. The ArUco `rvec` is dropped.
